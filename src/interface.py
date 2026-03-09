@@ -21,6 +21,41 @@ from .config import (
 )
 
 
+# ════════════════════════════════════════════════════════════════════════
+#  Calibration Overlay (full-screen)
+# ════════════════════════════════════════════════════════════════════════
+
+class CalibrationOverlay(QWidget):
+    """Full-screen calibration widget.
+
+    Uses QWidget instead of QDialog to avoid QDialog's built-in keyboard
+    handling (spacebar/enter activating buttons, escape closing).
+    Shows calibration dots one-by-one. The user fixates on each dot while
+    the system collects eye-feature samples. When done it emits the
+    collected (features, screen_target) pairs so EyeTracker can fit.
+    """
+
+    from PyQt5.QtCore import pyqtSignal
+    finished = pyqtSignal(int)  # 1 = accepted, 0 = rejected
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Window)
+        self.setWindowTitle("EyeWave -- Calibration")
+
+        self._points = list(CALIBRATION_POINTS)
+        self._current_idx = 0
+        self._samples_per_point = CALIBRATION_SAMPLES_PER_POINT
+
+        # Collected data
+        self._current_features = []       # features for the current point
+        self._all_features = []           # flat list of all feature vectors
+        self._all_targets = []            # corresponding (x, y) screen targets
+
+        self._collecting = False
+        self._done = False
+
+        self._init_ui()
+
     # ── UI ──────────────────────────────────────────────────────────────
 
     def _init_ui(self):
