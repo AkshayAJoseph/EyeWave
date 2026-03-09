@@ -30,6 +30,22 @@ RIGHT_IRIS = [473, 474, 475, 476, 477]
 
 # Head pose landmarks (nose tip, chin, left/right eye corners, mouth corners)
 HEAD_POSE_LANDMARKS = [1, 152, 33, 263, 61, 291]
+
+# ── 3D Head Pose (solvePnP) ───────────────────────────────────────────
+# Canonical 3D face model points (mm) matching HEAD_POSE_LANDMARKS order:
+#   nose tip, chin, left eye outer corner, right eye outer corner,
+#   left mouth corner, right mouth corner
+# Source: standard anthropometric averages
+import numpy as _np
+FACE_3D_MODEL = _np.array([
+    [   0.0,    0.0,    0.0],   # nose tip
+    [   0.0, -330.0,  -65.0],   # chin
+    [-225.0,  170.0, -135.0],   # left eye outer corner
+    [ 225.0,  170.0, -135.0],   # right eye outer corner
+    [-150.0,  -150.0, -125.0],  # left mouth corner
+    [ 150.0,  -150.0, -125.0],  # right mouth corner
+], dtype=_np.float64)
+
 # Approximate focal length as a multiple of frame width.
 # Heuristic: for most laptop/webcam cameras, fx ≈ frame_width works well.
 CAMERA_FOCAL_LENGTH_FACTOR = 1.0
