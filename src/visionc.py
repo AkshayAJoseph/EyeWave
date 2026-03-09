@@ -278,6 +278,18 @@ class EyeTracker:
 
         return yaw, pitch
 
+    # -- Blink Detection --------------------------------------------------
+
+    def _detect_blink(self, pts):
+        """Return True if the user is currently blinking (both eyes)."""
+        l_ear = eye_aspect_ratio(
+            pts[LEFT_EYE_LIDS[0]], pts[LEFT_EYE_LIDS[1]],
+            pts[LEFT_EYE_CORNERS[0]], pts[LEFT_EYE_CORNERS[1]])
+        r_ear = eye_aspect_ratio(
+            pts[RIGHT_EYE_LIDS[0]], pts[RIGHT_EYE_LIDS[1]],
+            pts[RIGHT_EYE_CORNERS[0]], pts[RIGHT_EYE_CORNERS[1]])
+        avg_ear = (l_ear + r_ear) / 2.0
+        return avg_ear < BLINK_EAR_THRESHOLD
 
     # -- Prediction -------------------------------------------------------
 
