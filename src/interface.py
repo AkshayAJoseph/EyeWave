@@ -22,6 +22,23 @@ from .config import (
 
 
 # ════════════════════════════════════════════════════════════════════════
+#  Word Predictor
+# ════════════════════════════════════════════════════════════════════════
+
+class WordPredictor:
+    """Prefix-based word prediction from a common-word list."""
+
+    def __init__(self):
+        self.common_words = COMMON_WORDS
+
+    def get_predictions(self, current_word, num=NUM_PREDICTIONS):
+        if not current_word:
+            return []
+        upper = current_word.upper()
+        return [w for w in self.common_words if w.startswith(upper)][:num]
+
+
+# ════════════════════════════════════════════════════════════════════════
 #  Calibration Overlay (full-screen)
 # ════════════════════════════════════════════════════════════════════════
 
