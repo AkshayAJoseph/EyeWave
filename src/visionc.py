@@ -1,14 +1,23 @@
-"""EyeWave Vision Module — Eye tracking with polynomial calibration.
+"""EyeWave Vision Module — faithful port of MonitorTracking.py's 3D gaze pipeline.
 
-Uses MediaPipe Face Mesh (solutions API) for iris / landmark detection
-and scikit-learn Ridge regression with polynomial features to learn a
-per-user mapping from raw eye features to screen (x, y) coordinates.
+Pipeline (matching MonitorTracking.py exactly):
+  1. MediaPipe Face Mesh → iris + nose landmarks
+  2. PCA head orientation from nose region (compute_and_draw_coordinate_box logic)
+  3. Eye sphere locking (iris position in head-local coords + camera-dir offset)
+  4. Sphere world reconstruction (nose-scale compensation, per-eye)
+  5. Binocular gaze direction (iris_3d - sphere_world, averaged, smoothed)
+  6. Direct angular gaze→screen mapping (convert_gaze_to_screen_coordinates logic)
+  7. Optional polynomial correction (residual refinement)
 """
 
 import json
 import os
+import math
+from collections import deque
+
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation as Rscipy
 from mediapipe.python.solutions import face_mesh as fm
 
 from .config import (
@@ -18,13 +27,109 @@ from .config import (
     BLINK_EAR_THRESHOLD, CALIBRATION_POLY_DEGREE, CALIBRATION_RIDGE_ALPHA,
     CALIBRATION_FILE,
     IRIS_H_CENTER, IRIS_H_GAIN, IRIS_V_CENTER, IRIS_V_GAIN,
-    FACE_3D_MODEL, CAMERA_FOCAL_LENGTH_FACTOR,
+    NOSE_INDICES, EYE_SPHERE_BASE_RADIUS,
+    GAZE_SMOOTH_LENGTH, GAZE_YAW_RANGE, GAZE_PITCH_RANGE,
 )
-from .utils import eye_aspect_ratio, estimate_3d_head_pose, compute_gaze_ray_intersection
+from .utils import eye_aspect_ratio
 
+
+# ════════════════════════════════════════════════════════════════════════
+#  Inline helpers — ported verbatim from MonitorTracking.py
+# ════════════════════════════════════════════════════════════════════════
+
+def _compute_scale(points_3d):
+    """Average pairwise distance (MonitorTracking.py → compute_scale)."""
+    n = len(points_3d)
+    total = 0.0
+    count = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            total += float(np.linalg.norm(points_3d[i] - points_3d[j]))
+            count += 1
+    return total / count if count > 0 else 1.0
+
+
+def _pca_orientation(points_3d, ref_matrix_container):
+    """PCA head orientation (MonitorTracking.py → compute_and_draw_coordinate_box).
+
+    Returns (center, R_final, points_3d).
+    """
+    center = np.mean(points_3d, axis=0)
+    centered = points_3d - center
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    eigvecs = eigvecs[:, np.argsort(-eigvals)]
+
+    if np.linalg.det(eigvecs) < 0:
+        eigvecs[:, 2] *= -1
+
+    r = Rscipy.from_matrix(eigvecs)
+    roll, pitch, yaw = r.as_euler('zyx', degrees=False)
+    R_final = Rscipy.from_euler('zyx', [roll, pitch, yaw]).as_matrix()
+
+    if ref_matrix_container[0] is None:
+        ref_matrix_container[0] = R_final.copy()
+    else:
+        R_ref = ref_matrix_container[0]
+        for i in range(3):
+            if np.dot(R_final[:, i], R_ref[:, i]) < 0:
+                R_final[:, i] *= -1
+
+    return center, R_final
+
+
+def _convert_gaze_to_screen(combined_gaze_direction,
+                            calibration_offset_yaw=0.0,
+                            calibration_offset_pitch=0.0,
+                            yaw_range=12.0, pitch_range=3.0):
+    """Direct angular mapping (MonitorTracking.py → convert_gaze_to_screen_coordinates).
+
+    Returns (norm_x, norm_y) in 0–1 range.
+    """
+    reference_forward = np.array([0, 0, -1], dtype=float)
+    avg_direction = combined_gaze_direction / np.linalg.norm(combined_gaze_direction)
+
+    # Horizontal (yaw)
+    xz_proj = np.array([avg_direction[0], 0, avg_direction[2]], dtype=float)
+    xz_proj /= np.linalg.norm(xz_proj)
+    yaw_rad = math.acos(np.clip(np.dot(reference_forward, xz_proj), -1.0, 1.0))
+    if avg_direction[0] < 0:
+        yaw_rad = -yaw_rad
+
+    # Vertical (pitch)
+    yz_proj = np.array([0, avg_direction[1], avg_direction[2]], dtype=float)
+    yz_proj /= np.linalg.norm(yz_proj)
+    pitch_rad = math.acos(np.clip(np.dot(reference_forward, yz_proj), -1.0, 1.0))
+    if avg_direction[1] > 0:
+        pitch_rad = -pitch_rad
+
+    yaw_deg = float(np.degrees(yaw_rad))
+    pitch_deg = float(np.degrees(pitch_rad))
+
+    # MonitorTracking sign convention
+    if yaw_deg < 0:
+        yaw_deg = -(yaw_deg)
+    elif yaw_deg > 0:
+        yaw_deg = -yaw_deg
+
+    # Apply calibration offsets
+    yaw_deg += calibration_offset_yaw
+    pitch_deg += calibration_offset_pitch
+
+    # Map to normalised 0–1 screen coordinates
+    norm_x = (yaw_deg + yaw_range) / (2 * yaw_range)
+    norm_y = (pitch_range - pitch_deg) / (2 * pitch_range)
+
+    norm_x = float(np.clip(norm_x, 0.0, 1.0))
+    norm_y = float(np.clip(norm_y, 0.0, 1.0))
+
+    return norm_x, norm_y
+
+
+# ════════════════════════════════════════════════════════════════════════
 
 class EyeTracker:
-    """MediaPipe-based eye tracker with polynomial calibration."""
+    """3D geometric eye tracker — faithful port of MonitorTracking.py."""
 
     def __init__(self):
         self.face_mesh = fm.FaceMesh(
@@ -34,18 +139,36 @@ class EyeTracker:
             min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
         )
 
-        # Calibration model (None until calibrated)
+        # --- PCA state (MonitorTracking: R_ref_nose) ---
+        self._ref_matrix = [None]
+
+        # --- Eye sphere state (MonitorTracking: per-eye, not combined) ---
+        self._left_sphere_locked = False
+        self._left_sphere_local_offset = None
+        self._left_calibration_nose_scale = None
+
+        self._right_sphere_locked = False
+        self._right_sphere_local_offset = None
+        self._right_calibration_nose_scale = None
+
+        # --- Gaze smoothing (MonitorTracking: combined_gaze_directions deque) ---
+        self._gaze_buffer = deque(maxlen=GAZE_SMOOTH_LENGTH)
+
+        # --- Screen calibration offsets (MonitorTracking: 's' key) ---
+        self._calib_yaw_offset = 0.0
+        self._calib_pitch_offset = 0.0
+
+        # --- Polynomial correction model (EyeWave addition, optional) ---
         self._model_x = None
         self._model_y = None
         self._poly = None
         self._is_calibrated = False
 
-        # Drift correction state
-        self._calib_feature_mean = None   # Mean features at calibration time
-        self._running_feature_mean = None # Running EMA of features during live use
-        self._drift_alpha = 0.01         # How fast running mean adapts (low = slow)
+        # Drift correction
+        self._calib_feature_mean = None
+        self._running_feature_mean = None
+        self._drift_alpha = 0.01
 
-        # Try to load saved calibration
         self._load_calibration()
 
     # -- Public API -------------------------------------------------------
@@ -54,56 +177,128 @@ class EyeTracker:
     def is_calibrated(self) -> bool:
         return self._is_calibrated
 
-    def process_frame(self, frame):
-        """Process a camera frame and return tracking results.
+    @property
+    def spheres_locked(self) -> bool:
+        return self._left_sphere_locked and self._right_sphere_locked
 
-        Returns:
-            (success, is_blinking, gaze_x, gaze_y, features)
-            - success: True if a face was detected.
-            - is_blinking: True if the user is blinking.
-            - gaze_x, gaze_y: Predicted screen coordinates (0-1) if calibrated,
-              otherwise raw iris ratios.
-            - features: Raw feature vector (used during calibration).
-        """
+    def process_frame(self, frame):
+        """Process a camera frame.  Returns (success, is_blinking, gx, gy, features)."""
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(rgb)
 
         if not results.multi_face_landmarks:
             return False, False, 0.5, 0.5, None
 
-        landmarks = results.multi_face_landmarks[0].landmark
+        face_landmarks = results.multi_face_landmarks[0].landmark
         h, w = frame.shape[:2]
 
-        # Convert to pixel coordinates
-        pts = np.array([(lm.x * w, lm.y * h) for lm in landmarks])
+        # 2D pixel coords
+        pts = np.array([(lm.x * w, lm.y * h) for lm in face_landmarks])
 
-        # Extract features (now needs frame height for solvePnP camera matrix)
-        features = self._extract_features(pts, w, h)
+        # Blink detection
         is_blinking = self._detect_blink(pts)
 
+        # ── 1. PCA head orientation (exactly as MonitorTracking) ──────
+        nose_points_3d = np.array([
+            [face_landmarks[i].x * w,
+             face_landmarks[i].y * h,
+             face_landmarks[i].z * w]
+            for i in NOSE_INDICES
+        ], dtype=float)
+
+        try:
+            head_center, R_final = _pca_orientation(
+                nose_points_3d, self._ref_matrix)
+        except Exception as e:
+            print(f"PCA error: {e}")
+            return True, is_blinking, 0.5, 0.5, None
+
+        # ── 2. Iris 3D positions (exactly as MonitorTracking) ─────────
+        left_iris = face_landmarks[468]   # LEFT_IRIS[0]
+        right_iris = face_landmarks[473]  # RIGHT_IRIS[0]
+
+        iris_3d_left = np.array([left_iris.x * w,
+                                 left_iris.y * h,
+                                 left_iris.z * w], dtype=float)
+        iris_3d_right = np.array([right_iris.x * w,
+                                  right_iris.y * h,
+                                  right_iris.z * w], dtype=float)
+
+        # ── 3. Auto-lock spheres on first face detection ──────────────
+        if not (self._left_sphere_locked and self._right_sphere_locked):
+            self._lock_spheres(head_center, R_final,
+                               iris_3d_left, iris_3d_right, nose_points_3d)
+
+        # ── 4. Compute sphere world positions (per-eye, as MonitorTracking) ──
+        gaze_x, gaze_y = 0.5, 0.5
+        gaze_dir_smoothed = None
+        sphere_world_l = None
+        sphere_world_r = None
+
+        if self._left_sphere_locked:
+            current_nose_scale = _compute_scale(nose_points_3d)
+            scale_ratio = (current_nose_scale / self._left_calibration_nose_scale
+                           if self._left_calibration_nose_scale else 1.0)
+            scaled_offset = self._left_sphere_local_offset * scale_ratio
+            sphere_world_l = head_center + R_final @ scaled_offset
+
+        if self._right_sphere_locked:
+            current_nose_scale = _compute_scale(nose_points_3d)
+            scale_ratio_r = (current_nose_scale / self._right_calibration_nose_scale
+                             if self._right_calibration_nose_scale else 1.0)
+            scaled_offset_r = self._right_sphere_local_offset * scale_ratio_r
+            sphere_world_r = head_center + R_final @ scaled_offset_r
+
+        # ── 5. Binocular gaze direction (exactly as MonitorTracking) ──
+        if (self._left_sphere_locked and self._right_sphere_locked
+                and sphere_world_l is not None and sphere_world_r is not None):
+
+            # Individual gaze directions
+            left_gaze_dir = iris_3d_left - sphere_world_l
+            left_gaze_dir /= np.linalg.norm(left_gaze_dir)
+
+            right_gaze_dir = iris_3d_right - sphere_world_r
+            right_gaze_dir /= np.linalg.norm(right_gaze_dir)
+
+            # Combined (average)
+            raw_combined_direction = (left_gaze_dir + right_gaze_dir) / 2
+            raw_combined_direction /= np.linalg.norm(raw_combined_direction)
+
+            # Smooth via deque
+            self._gaze_buffer.append(raw_combined_direction)
+            avg_combined_direction = np.mean(self._gaze_buffer, axis=0)
+            avg_combined_direction /= np.linalg.norm(avg_combined_direction)
+
+            gaze_dir_smoothed = avg_combined_direction
+
+            # ── 6. Direct angular screen mapping ──────────────────────
+            gaze_x, gaze_y = _convert_gaze_to_screen(
+                avg_combined_direction,
+                self._calib_yaw_offset,
+                self._calib_pitch_offset,
+                GAZE_YAW_RANGE, GAZE_PITCH_RANGE)
+
+        # ── 7. Feature extraction for polynomial correction ───────────
+        features = self._extract_features(
+            pts, w, h, head_center, R_final, nose_points_3d,
+            gaze_x, gaze_y, gaze_dir_smoothed)
+
+        # ── 8. Apply polynomial correction if calibrated ──────────────
         if self._is_calibrated and features is not None:
             gaze_x, gaze_y = self._predict(features)
-        else:
-            # Fallback: average iris ratio
-            gaze_x = features[0] if features is not None else 0.5
-            gaze_y = features[1] if features is not None else 0.5
 
         return True, is_blinking, float(gaze_x), float(gaze_y), features
 
     def calibrate(self, feature_samples, screen_targets):
-        """Fit the polynomial regression model from calibration data.
-
-        Args:
-            feature_samples: list of feature vectors (one per sample).
-            screen_targets:  list of (x, y) tuples -- known screen positions.
-        """
+        """Fit polynomial residual correction model."""
         from sklearn.preprocessing import PolynomialFeatures
         from sklearn.linear_model import Ridge
 
         X = np.array(feature_samples)
         Y = np.array(screen_targets)
 
-        self._poly = PolynomialFeatures(degree=CALIBRATION_POLY_DEGREE, include_bias=True)
+        self._poly = PolynomialFeatures(
+            degree=CALIBRATION_POLY_DEGREE, include_bias=True)
         X_poly = self._poly.fit_transform(X)
 
         self._model_x = Ridge(alpha=CALIBRATION_RIDGE_ALPHA)
@@ -113,197 +308,201 @@ class EyeTracker:
         self._model_y.fit(X_poly, Y[:, 1])
 
         self._is_calibrated = True
-
-        # Store calibration baseline for drift correction
         self._calib_feature_mean = np.mean(X, axis=0)
         self._running_feature_mean = self._calib_feature_mean.copy()
 
-        self._save_calibration()
+        # Also compute & store the screen-center calibration offsets
+        # (like MonitorTracking's 's' key — zero out yaw/pitch at center)
+        if len(self._gaze_buffer) > 0:
+            current_dir = np.mean(self._gaze_buffer, axis=0)
+            n = np.linalg.norm(current_dir)
+            if n > 1e-9:
+                current_dir /= n
+                _, _, raw_yaw, raw_pitch = self._raw_angles(current_dir)
+                # Don't override — the polynomial model handles this
 
-        print(f"Calibration complete -- {len(feature_samples)} samples, "
+        self._save_calibration()
+        print(f"Calibration complete — {len(feature_samples)} samples, "
               f"degree {CALIBRATION_POLY_DEGREE}")
+
+    def lock_spheres_now(self, frame):
+        """Re-lock eye spheres from an external call (e.g. calibration start)."""
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
+        if not results.multi_face_landmarks:
+            return False
+
+        face_landmarks = results.multi_face_landmarks[0].landmark
+        h, w = frame.shape[:2]
+
+        nose_points_3d = np.array([
+            [face_landmarks[i].x * w,
+             face_landmarks[i].y * h,
+             face_landmarks[i].z * w]
+            for i in NOSE_INDICES
+        ], dtype=float)
+
+        head_center, R_final = _pca_orientation(
+            nose_points_3d, self._ref_matrix)
+
+        left_iris = face_landmarks[468]
+        right_iris = face_landmarks[473]
+        iris_3d_left = np.array([left_iris.x * w, left_iris.y * h,
+                                 left_iris.z * w], dtype=float)
+        iris_3d_right = np.array([right_iris.x * w, right_iris.y * h,
+                                  right_iris.z * w], dtype=float)
+
+        self._lock_spheres(head_center, R_final,
+                           iris_3d_left, iris_3d_right, nose_points_3d)
+        return True
+
+    # -- Internal helpers -------------------------------------------------
+
+    def _lock_spheres(self, head_center, R_final,
+                      iris_3d_left, iris_3d_right, nose_points_3d):
+        """Lock eye spheres — exactly as MonitorTracking.py 'c' key handler."""
+        current_nose_scale = _compute_scale(nose_points_3d)
+        base_radius = EYE_SPHERE_BASE_RADIUS
+
+        camera_dir_world = np.array([0, 0, 1], dtype=float)
+        camera_dir_local = R_final.T @ camera_dir_world
+
+        # Lock LEFT eye
+        self._left_sphere_local_offset = R_final.T @ (iris_3d_left - head_center)
+        self._left_sphere_local_offset += base_radius * camera_dir_local
+        self._left_calibration_nose_scale = current_nose_scale
+        self._left_sphere_locked = True
+
+        # Lock RIGHT eye
+        self._right_sphere_local_offset = R_final.T @ (iris_3d_right - head_center)
+        self._right_sphere_local_offset += base_radius * camera_dir_local
+        self._right_calibration_nose_scale = current_nose_scale
+        self._right_sphere_locked = True
+
+        self._gaze_buffer.clear()
+        print("[EyeWave] Both eye spheres locked")
+
+    def _raw_angles(self, gaze_dir):
+        """Get raw yaw/pitch angles from gaze direction (for calibration offsets)."""
+        ref = np.array([0, 0, -1], dtype=float)
+        d = gaze_dir / np.linalg.norm(gaze_dir)
+
+        xz = np.array([d[0], 0, d[2]], dtype=float)
+        xz /= np.linalg.norm(xz)
+        yaw_rad = math.acos(np.clip(np.dot(ref, xz), -1.0, 1.0))
+        if d[0] < 0:
+            yaw_rad = -yaw_rad
+        yaw_deg = float(np.degrees(yaw_rad))
+        if yaw_deg < 0:
+            yaw_deg = -yaw_deg
+        elif yaw_deg > 0:
+            yaw_deg = -yaw_deg
+
+        yz = np.array([0, d[1], d[2]], dtype=float)
+        yz /= np.linalg.norm(yz)
+        pitch_rad = math.acos(np.clip(np.dot(ref, yz), -1.0, 1.0))
+        if d[1] > 0:
+            pitch_rad = -pitch_rad
+        pitch_deg = float(np.degrees(pitch_rad))
+
+        return 0, 0, yaw_deg, pitch_deg
 
     # -- Feature Extraction -----------------------------------------------
 
-    def _extract_features(self, pts, frame_w, frame_h=None):
-        """Build a feature vector from current face landmarks.
+    def _extract_features(self, pts, w, h,
+                          head_center, R_final, nose_pts_3d,
+                          geo_gaze_x, geo_gaze_y, gaze_dir_smoothed):
+        """12-dimensional feature vector for polynomial correction.
 
-        Features (18-dimensional):
-          0:  left iris H ratio (amplified)
-          1:  left iris V ratio (amplified)
-          2:  right iris H ratio (amplified)
-          3:  right iris V ratio (amplified)
-          4:  averaged H ratio (L+R)/2 (amplified) — strongest horizontal signal
-          5:  averaged V ratio (L+R)/2 (amplified)
-          6:  head yaw   (2D estimate)
-          7:  head pitch (2D estimate)
-          8:  left  eye aspect ratio
-          9:  right eye aspect ratio
-         10:  iris H pixel delta / face width (scale-invariant horizontal offset)
-         11:  iris V pixel delta / face width
-         12:  3D head yaw   (solvePnP Euler, degrees, /180 normalised)
-         13:  3D head pitch (solvePnP Euler, degrees, /180 normalised)
-         14:  3D head roll  (solvePnP Euler, degrees, /180 normalised)
-         15:  head distance  (tvec Z / face_width, scale-invariant depth)
-         16:  gaze ray intersection X (0-1 screen coordinate)
-         17:  gaze ray intersection Y (0-1 screen coordinate)
+          0-1:  geometric gaze (x, y) — direct angular mapping
+          2-4:  smoothed gaze direction (dx, dy, dz)
+          5-6:  left iris H/V ratios (amplified)
+          7-8:  right iris H/V ratios (amplified)
+           9:   nose scale ratio
+         10-11: head yaw, pitch (2D estimate)
         """
         try:
-            # Default frame_h from aspect ratio if not supplied
-            if frame_h is None:
-                frame_h = int(frame_w * 480 / 640)
+            if gaze_dir_smoothed is not None:
+                gd_x = float(gaze_dir_smoothed[0])
+                gd_y = float(gaze_dir_smoothed[1])
+                gd_z = float(gaze_dir_smoothed[2])
+            else:
+                gd_x, gd_y, gd_z = 0.0, 0.0, -1.0
 
-            # Raw iris ratios (both eyes)
-            l_iris_h_raw = self._iris_ratio_h(pts, LEFT_EYE_CORNERS, LEFT_IRIS)
-            l_iris_v_raw = self._iris_ratio_v(pts, LEFT_EYE_LIDS, LEFT_IRIS)
-            r_iris_h_raw = self._iris_ratio_h(pts, RIGHT_EYE_CORNERS, RIGHT_IRIS)
-            r_iris_v_raw = self._iris_ratio_v(pts, RIGHT_EYE_LIDS, RIGHT_IRIS)
+            l_h = self._iris_ratio_h(pts, LEFT_EYE_CORNERS, LEFT_IRIS)
+            l_v = self._iris_ratio_v(pts, LEFT_EYE_LIDS, LEFT_IRIS)
+            r_h = self._iris_ratio_h(pts, RIGHT_EYE_CORNERS, RIGHT_IRIS)
+            r_v = self._iris_ratio_v(pts, RIGHT_EYE_LIDS, RIGHT_IRIS)
 
-            # Amplify: re-center around 0.5 and stretch
-            l_iris_h = 0.5 + (l_iris_h_raw - IRIS_H_CENTER) * IRIS_H_GAIN
-            r_iris_h = 0.5 + (r_iris_h_raw - IRIS_H_CENTER) * IRIS_H_GAIN
-            l_iris_v = 0.5 + (l_iris_v_raw - IRIS_V_CENTER) * IRIS_V_GAIN
-            r_iris_v = 0.5 + (r_iris_v_raw - IRIS_V_CENTER) * IRIS_V_GAIN
+            l_h = 0.5 + (l_h - IRIS_H_CENTER) * IRIS_H_GAIN
+            r_h = 0.5 + (r_h - IRIS_H_CENTER) * IRIS_H_GAIN
+            l_v = 0.5 + (l_v - IRIS_V_CENTER) * IRIS_V_GAIN
+            r_v = 0.5 + (r_v - IRIS_V_CENTER) * IRIS_V_GAIN
 
-            # Averaged ratios (reduces per-eye noise, strong overall signal)
-            avg_h = (l_iris_h + r_iris_h) / 2.0
-            avg_v = (l_iris_v + r_iris_v) / 2.0
+            if (self._left_calibration_nose_scale
+                    and self._left_calibration_nose_scale > 0):
+                current_scale = _compute_scale(nose_pts_3d)
+                scale_ratio = current_scale / self._left_calibration_nose_scale
+            else:
+                scale_ratio = 1.0
 
-            # Head pose (lightweight 2D estimate — kept for continuity)
             yaw_2d, pitch_2d = self._estimate_head_pose(pts)
 
-            # Eye Aspect Ratios
-            l_ear = eye_aspect_ratio(
-                pts[LEFT_EYE_LIDS[0]], pts[LEFT_EYE_LIDS[1]],
-                pts[LEFT_EYE_CORNERS[0]], pts[LEFT_EYE_CORNERS[1]])
-            r_ear = eye_aspect_ratio(
-                pts[RIGHT_EYE_LIDS[0]], pts[RIGHT_EYE_LIDS[1]],
-                pts[RIGHT_EYE_CORNERS[0]], pts[RIGHT_EYE_CORNERS[1]])
-
-            # Iris pixel delta (scale-invariant via face width)
-            face_width = abs(pts[263][0] - pts[33][0])
-            if face_width < 1:
-                face_width = 1.0
-            l_iris_center = pts[LEFT_IRIS[0]]
-            r_iris_center = pts[RIGHT_IRIS[0]]
-            avg_iris_x = (l_iris_center[0] + r_iris_center[0]) / 2.0
-            avg_iris_y = (l_iris_center[1] + r_iris_center[1]) / 2.0
-            face_center_x = (pts[33][0] + pts[263][0]) / 2.0
-            face_center_y = (pts[33][1] + pts[263][1]) / 2.0
-            iris_dx = (avg_iris_x - face_center_x) / face_width
-            iris_dy = (avg_iris_y - face_center_y) / face_width
-
-            # ── 3D head pose (solvePnP) ─────────────────────────────────
-            rvec, tvec, euler, pose_ok = estimate_3d_head_pose(
-                pts, frame_w, frame_h,
-                FACE_3D_MODEL, CAMERA_FOCAL_LENGTH_FACTOR,
-            )
-
-            if pose_ok:
-                yaw_3d   = euler[0] / 180.0   # normalise to roughly [-1, 1]
-                pitch_3d = euler[1] / 180.0
-                roll_3d  = euler[2] / 180.0
-                head_dist = float(tvec[2, 0]) / face_width  # depth / face width
-            else:
-                yaw_3d = pitch_3d = roll_3d = 0.0
-                head_dist = 0.0
-
-            # ── Gaze ray intersection ───────────────────────────────────
-            if pose_ok:
-                gaze_x, gaze_y = compute_gaze_ray_intersection(
-                    rvec, tvec,
-                    l_iris_center, r_iris_center,
-                    frame_w, frame_h,
-                    CAMERA_FOCAL_LENGTH_FACTOR,
-                )
-            else:
-                gaze_x, gaze_y = 0.5, 0.5
-
             return np.array([
-                l_iris_h, l_iris_v,
-                r_iris_h, r_iris_v,
-                avg_h, avg_v,
+                geo_gaze_x, geo_gaze_y,
+                gd_x, gd_y, gd_z,
+                l_h, l_v, r_h, r_v,
+                scale_ratio,
                 yaw_2d, pitch_2d,
-                l_ear, r_ear,
-                iris_dx, iris_dy,
-                yaw_3d, pitch_3d, roll_3d,
-                head_dist,
-                gaze_x, gaze_y,
             ], dtype=np.float64)
         except Exception as e:
-            print(f"Feature extraction error: {e}")
+            print(f"Feature error: {e}")
             return None
 
     def _iris_ratio_h(self, pts, eye_corners, iris_indices):
-        """Horizontal iris position ratio (0=inner corner, 1=outer corner)."""
-        inner = pts[eye_corners[0]]
-        outer = pts[eye_corners[1]]
-        iris_center = pts[iris_indices[0]]
+        inner, outer = pts[eye_corners[0]], pts[eye_corners[1]]
+        iris_c = pts[iris_indices[0]]
         width = outer[0] - inner[0]
-        if abs(width) < 1:
-            return 0.5
-        return float((iris_center[0] - inner[0]) / width)  # Don't clip — let amplification work
+        return float((iris_c[0] - inner[0]) / width) if abs(width) > 1 else 0.5
 
     def _iris_ratio_v(self, pts, eye_lids, iris_indices):
-        """Vertical iris position ratio (0=top lid, 1=bottom lid)."""
-        top = pts[eye_lids[0]]
-        bottom = pts[eye_lids[1]]
-        iris_center = pts[iris_indices[0]]
+        top, bottom = pts[eye_lids[0]], pts[eye_lids[1]]
+        iris_c = pts[iris_indices[0]]
         height = bottom[1] - top[1]
         if abs(height) < 1:
             return 0.5
-        return float(np.clip((iris_center[1] - top[1]) / height, 0, 1))
+        return float(np.clip((iris_c[1] - top[1]) / height, 0, 1))
 
     def _estimate_head_pose(self, pts):
-        """Lightweight 2D head pose estimate (yaw, pitch) in normalized range."""
-        nose = pts[1]
-        left_eye = pts[33]
-        right_eye = pts[263]
-        chin = pts[152]
-
-        # Yaw: nose position between eye corners
-        face_width = right_eye[0] - left_eye[0]
-        if abs(face_width) < 1:
-            yaw = 0.5
-        else:
-            yaw = float(np.clip((nose[0] - left_eye[0]) / face_width, 0, 1))
-
-        # Pitch: nose position between eye midpoint and chin
-        eyes_mid_y = (left_eye[1] + right_eye[1]) / 2.0
-        face_height = chin[1] - eyes_mid_y
-        if abs(face_height) < 1:
-            pitch = 0.5
-        else:
-            pitch = float(np.clip((nose[1] - eyes_mid_y) / face_height, 0, 1))
-
+        nose, l_eye, r_eye, chin = pts[1], pts[33], pts[263], pts[152]
+        fw = r_eye[0] - l_eye[0]
+        yaw = float(np.clip((nose[0] - l_eye[0]) / fw, 0, 1)) if abs(fw) > 1 else 0.5
+        mid_y = (l_eye[1] + r_eye[1]) / 2.0
+        fh = chin[1] - mid_y
+        pitch = float(np.clip((nose[1] - mid_y) / fh, 0, 1)) if abs(fh) > 1 else 0.5
         return yaw, pitch
 
     # -- Blink Detection --------------------------------------------------
 
     def _detect_blink(self, pts):
-        """Return True if the user is currently blinking (both eyes)."""
         l_ear = eye_aspect_ratio(
             pts[LEFT_EYE_LIDS[0]], pts[LEFT_EYE_LIDS[1]],
             pts[LEFT_EYE_CORNERS[0]], pts[LEFT_EYE_CORNERS[1]])
         r_ear = eye_aspect_ratio(
             pts[RIGHT_EYE_LIDS[0]], pts[RIGHT_EYE_LIDS[1]],
             pts[RIGHT_EYE_CORNERS[0]], pts[RIGHT_EYE_CORNERS[1]])
-        avg_ear = (l_ear + r_ear) / 2.0
-        return avg_ear < BLINK_EAR_THRESHOLD
+        return (l_ear + r_ear) / 2.0 < BLINK_EAR_THRESHOLD
 
     # -- Prediction -------------------------------------------------------
 
     def _predict(self, features):
-        """Map raw features -> screen (x, y) with online drift correction."""
-        # Update running mean of features (EMA)
         if self._running_feature_mean is not None:
             self._running_feature_mean = (
                 (1 - self._drift_alpha) * self._running_feature_mean +
-                self._drift_alpha * features
-            )
+                self._drift_alpha * features)
 
-        # Apply drift correction: re-center features around calibration baseline
-        if self._calib_feature_mean is not None and self._running_feature_mean is not None:
+        if (self._calib_feature_mean is not None
+                and self._running_feature_mean is not None):
             drift = self._running_feature_mean - self._calib_feature_mean
             corrected = features - drift
         else:
@@ -317,7 +516,6 @@ class EyeTracker:
     # -- Persistence ------------------------------------------------------
 
     def _save_calibration(self):
-        """Save model parameters to a JSON file."""
         if not self._is_calibrated:
             return
         data = {
@@ -327,17 +525,23 @@ class EyeTracker:
             "model_y_coef": self._model_y.coef_.tolist(),
             "model_y_intercept": float(self._model_y.intercept_),
             "n_features_in": self._poly.n_features_in_,
-            "feature_mean": self._calib_feature_mean.tolist() if self._calib_feature_mean is not None else None,
+            "feature_mean": (self._calib_feature_mean.tolist()
+                            if self._calib_feature_mean is not None else None),
+            # Per-eye sphere state
+            "left_sphere_offset": (self._left_sphere_local_offset.tolist()
+                                   if self._left_sphere_local_offset is not None else None),
+            "right_sphere_offset": (self._right_sphere_local_offset.tolist()
+                                    if self._right_sphere_local_offset is not None else None),
+            "left_calib_nose_scale": self._left_calibration_nose_scale,
+            "right_calib_nose_scale": self._right_calibration_nose_scale,
         }
         with open(CALIBRATION_FILE, "w") as f:
             json.dump(data, f, indent=2)
-        print(f"Calibration saved to {CALIBRATION_FILE}")
+        print(f"Calibration saved → {CALIBRATION_FILE}")
 
     def _load_calibration(self):
-        """Load model parameters from a JSON file (if it exists)."""
         if not os.path.exists(CALIBRATION_FILE):
             return
-
         try:
             from sklearn.preprocessing import PolynomialFeatures
             from sklearn.linear_model import Ridge
@@ -346,11 +550,14 @@ class EyeTracker:
                 data = json.load(f)
 
             n_features = data["n_features_in"]
-            degree = data["poly_degree"]
+            if n_features != 12:
+                print(f"⚠ Saved calibration has {n_features} features, "
+                      f"expected 12. Please recalibrate.")
+                return
 
-            self._poly = PolynomialFeatures(degree=degree, include_bias=True)
-            dummy = np.zeros((1, n_features))
-            self._poly.fit(dummy)
+            self._poly = PolynomialFeatures(
+                degree=data["poly_degree"], include_bias=True)
+            self._poly.fit(np.zeros((1, n_features)))
 
             self._model_x = Ridge(alpha=CALIBRATION_RIDGE_ALPHA)
             self._model_x.coef_ = np.array(data["model_x_coef"])
@@ -362,26 +569,29 @@ class EyeTracker:
             self._model_y.intercept_ = data["model_y_intercept"]
             self._model_y.n_features_in_ = self._poly.n_output_features_
 
-            # Check feature dimension compatibility (12 → 18 migration)
-            expected_features = 18
-            if n_features != expected_features:
-                print(f"⚠ Saved calibration has {n_features} features, "
-                      f"expected {expected_features}. Please recalibrate.")
-                return
-
             self._is_calibrated = True
 
-            # Restore drift correction baseline
-            if "feature_mean" in data and data["feature_mean"] is not None:
+            if data.get("feature_mean"):
                 self._calib_feature_mean = np.array(data["feature_mean"])
                 self._running_feature_mean = self._calib_feature_mean.copy()
+
+            # Restore per-eye sphere state
+            if data.get("left_sphere_offset"):
+                self._left_sphere_local_offset = np.array(data["left_sphere_offset"])
+                self._left_calibration_nose_scale = data["left_calib_nose_scale"]
+                self._left_sphere_locked = True
+            if data.get("right_sphere_offset"):
+                self._right_sphere_local_offset = np.array(data["right_sphere_offset"])
+                self._right_calibration_nose_scale = data["right_calib_nose_scale"]
+                self._right_sphere_locked = True
+
+            if self._left_sphere_locked and self._right_sphere_locked:
+                print("Eye sphere state restored from calibration")
 
             print(f"Calibration loaded from {CALIBRATION_FILE}")
         except Exception as e:
             print(f"Could not load calibration: {e}")
             self._is_calibrated = False
-
-    # -- Cleanup ----------------------------------------------------------
 
     def __del__(self):
         if hasattr(self, "face_mesh"):

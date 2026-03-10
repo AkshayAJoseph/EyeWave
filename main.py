@@ -69,6 +69,16 @@ class EyeWaveApp:
 
     def start_calibration(self):
         """Open the calibration overlay (non-blocking so timer keeps running)."""
+        # Re-lock eye spheres with the current frame
+        ret, frame = self.cap.read()
+        if ret:
+            frame = cv2.flip(frame, 1)
+            locked = self.tracker.lock_spheres_now(frame)
+            if locked:
+                print("Eye spheres re-locked for calibration")
+            self.filter_x.reset()
+            self.filter_y.reset()
+
         self.cal_overlay = CalibrationOverlay(self.gui)
         self.is_calibrating = True
         self.cal_overlay.finished.connect(self._on_calibration_done)

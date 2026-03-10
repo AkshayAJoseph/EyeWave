@@ -31,28 +31,26 @@ RIGHT_IRIS = [473, 474, 475, 476, 477]
 # Head pose landmarks (nose tip, chin, left/right eye corners, mouth corners)
 HEAD_POSE_LANDMARKS = [1, 152, 33, 263, 61, 291]
 
-# ── 3D Head Pose (solvePnP) ───────────────────────────────────────────
-# Canonical 3D face model points (mm) matching HEAD_POSE_LANDMARKS order:
-#   nose tip, chin, left eye outer corner, right eye outer corner,
-#   left mouth corner, right mouth corner
-# Source: standard anthropometric averages
-import numpy as _np
-FACE_3D_MODEL = _np.array([
-    [   0.0,    0.0,    0.0],   # nose tip
-    [   0.0, -330.0,  -65.0],   # chin
-    [-225.0,  170.0, -135.0],   # left eye outer corner
-    [ 225.0,  170.0, -135.0],   # right eye outer corner
-    [-150.0,  -150.0, -125.0],  # left mouth corner
-    [ 150.0,  -150.0, -125.0],  # right mouth corner
-], dtype=_np.float64)
+# ── 3D Head Orientation (PCA from nose region) ────────────────────────
+# Nose-region landmark indices for stable PCA-based head orientation.
+# These landmarks are near the nose and are less affected by lateral
+# head movement, providing a stable reference frame.
+NOSE_INDICES = [4, 45, 275, 220, 440, 1, 5, 51, 281, 44, 274, 241,
+                461, 125, 354, 218, 438, 195, 167, 393, 165, 391,
+                3, 248]
 
-# Approximate focal length as a multiple of frame width.
-# Heuristic: for most laptop/webcam cameras, fx ≈ frame_width works well.
-CAMERA_FOCAL_LENGTH_FACTOR = 1.0
+# ── Eye Sphere Tracking ───────────────────────────────────────────────
+EYE_SPHERE_BASE_RADIUS = 20   # Radius at calibration distance (px-scale units)
 
-# Approximate distance from camera to user's eyes (cm).
-# Used to define the screen plane for gaze ray intersection.
-SCREEN_DISTANCE_CM = 60.0
+# ── Gaze Direction ────────────────────────────────────────────────────
+GAZE_SMOOTH_LENGTH = 10       # Number of frames to average for gaze smoothing
+
+# Degree ranges for angular→screen mapping (from MonitorTracking.py)
+# At ±GAZE_YAW_RANGE degrees, the gaze reaches the left/right screen edge.
+# At ±GAZE_PITCH_RANGE degrees, the gaze reaches the top/bottom screen edge.
+GAZE_YAW_RANGE = 12.0         # degrees left/right
+GAZE_PITCH_RANGE = 3.0        # degrees up/down
+
 
 # ── Blink Detection ───────────────────────────────────────────────────
 BLINK_EAR_THRESHOLD = 0.18   # Eye Aspect Ratio below this = blink
