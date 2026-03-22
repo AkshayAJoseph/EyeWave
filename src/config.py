@@ -1,137 +1,174 @@
-# EyeWave Configuration Constants
+"""
+config.py
+=========
+All constants, layouts, vocabulary, window geometry, and tuning parameters.
+Edit this file to change timing, colours, layouts, or file paths.
+"""
 
 import os
+import math
 
-# ── Paths ──────────────────────────────────────────────────────────────
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ASSETS_DIR = os.path.join(PROJECT_ROOT, "assets")
-CALIBRATION_FILE = os.path.join(PROJECT_ROOT, "calibration.json")
-CLICK_SOUND = os.path.join(ASSETS_DIR, "click.wav")
+try:
+    import pyautogui
+    MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
+except ImportError:
+    MONITOR_WIDTH, MONITOR_HEIGHT = 1920, 1080
 
-# ── Camera ─────────────────────────────────────────────────────────────
-CAMERA_INDEX = 0
-CAMERA_WIDTH = 640
-CAMERA_HEIGHT = 480
-FPS_TARGET = 30
-TIMER_INTERVAL_MS = 1000 // FPS_TARGET  # ~33ms
+# ─────────────────────────────────────────────────────────────────────────────
+#  FILE PATHS
+# ─────────────────────────────────────────────────────────────────────────────
+BASE_DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ASSETS_DIR      = os.path.join(BASE_DIR, "assets")
+CALIB_FILE      = os.path.join(BASE_DIR, "calibration.json")
+GAZE_DATA_FILE  = os.path.join(BASE_DIR, "gaze_data.csv")
+CLICK_SOUND     = os.path.join(ASSETS_DIR, "click.wav")
+FACE_LANDMARKER = os.path.join(ASSETS_DIR, "face_landmarker.task")
 
-# ── MediaPipe Face Mesh ────────────────────────────────────────────────
-MAX_NUM_FACES = 1
-MIN_DETECTION_CONFIDENCE = 0.5
-MIN_TRACKING_CONFIDENCE = 0.5
+# ─────────────────────────────────────────────────────────────────────────────
+#  KEYBOARD LAYOUTS
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Eye landmark indices (MediaPipe face mesh)
-LEFT_EYE_CORNERS = [33, 133]       # inner, outer corner
-LEFT_EYE_LIDS = [159, 145]         # top, bottom lid
-RIGHT_EYE_CORNERS = [362, 263]
-RIGHT_EYE_LIDS = [386, 374]
-LEFT_IRIS = [468, 469, 470, 471, 472]
-RIGHT_IRIS = [473, 474, 475, 476, 477]
-
-# Head pose landmarks (nose tip, chin, left/right eye corners, mouth corners)
-HEAD_POSE_LANDMARKS = [1, 152, 33, 263, 61, 291]
-
-# ── 3D Head Orientation (PCA from nose region) ────────────────────────
-# Nose-region landmark indices for stable PCA-based head orientation.
-# These landmarks are near the nose and are less affected by lateral
-# head movement, providing a stable reference frame.
-NOSE_INDICES = [4, 45, 275, 220, 440, 1, 5, 51, 281, 44, 274, 241,
-                461, 125, 354, 218, 438, 195, 167, 393, 165, 391,
-                3, 248]
-
-# ── Eye Sphere Tracking ───────────────────────────────────────────────
-EYE_SPHERE_BASE_RADIUS = 20   # Radius at calibration distance (px-scale units)
-
-# ── Gaze Direction ────────────────────────────────────────────────────
-GAZE_SMOOTH_LENGTH = 10       # Number of frames to average for gaze smoothing
-
-# Degree ranges for angular→screen mapping (from MonitorTracking.py)
-# At ±GAZE_YAW_RANGE degrees, the gaze reaches the left/right screen edge.
-# At ±GAZE_PITCH_RANGE degrees, the gaze reaches the top/bottom screen edge.
-GAZE_YAW_RANGE = 12.0         # degrees left/right
-GAZE_PITCH_RANGE = 3.0        # degrees up/down
-
-
-# ── Blink Detection ───────────────────────────────────────────────────
-BLINK_EAR_THRESHOLD = 0.18   # Eye Aspect Ratio below this = blink
-BLINK_MIN_FRAMES = 3         # Minimum frames for a valid blink
-BLINK_MAX_FRAMES = 12        # Maximum frames (longer = intentional close)
-
-# ── Gaze Smoothing ────────────────────────────────────────────────────
-SMOOTH_FACTOR = 0.45          # EMA alpha: higher = more responsive, lower = smoother
-
-# ── Calibration ───────────────────────────────────────────────────────
-# 16-point grid: more coverage, especially along edges and midpoints
-CALIBRATION_POINTS = [
-    # (norm_x, norm_y, label)
-    # Center
-    (0.5,  0.5,  "Center"),
-    # Corners
-    (0.08, 0.08, "Top-Left"),
-    (0.92, 0.08, "Top-Right"),
-    (0.08, 0.92, "Bottom-Left"),
-    (0.92, 0.92, "Bottom-Right"),
-    # Edges
-    (0.5,  0.08, "Top-Center"),
-    (0.5,  0.92, "Bottom-Center"),
-    (0.08, 0.5,  "Left"),
-    (0.92, 0.5,  "Right"),
-    # Horizontal midpoints (helps with horizontal accuracy)
-    (0.25, 0.3,  "Upper-Left Quarter"),
-    (0.75, 0.3,  "Upper-Right Quarter"),
-    (0.25, 0.7,  "Lower-Left Quarter"),
-    (0.75, 0.7,  "Lower-Right Quarter"),
-    # Extra horizontal points at center height
-    (0.3,  0.5,  "Center-Left Mid"),
-    (0.7,  0.5,  "Center-Right Mid"),
-    # Center verification
-    (0.5,  0.35, "Upper-Center"),
-]
-CALIBRATION_SAMPLES_PER_POINT = 35    # ~1.2 seconds at 30fps
-CALIBRATION_POLY_DEGREE = 2           # Polynomial degree for regression
-CALIBRATION_RIDGE_ALPHA = 0.5         # Lower alpha = less regularization = tighter fit
-
-# ── Iris Range Amplification ─────────────────────────────────────────
-# Iris ratios typically range 0.35-0.65 (very narrow). These params
-# re-center and amplify them before they go into the regression.
-IRIS_H_CENTER = 0.50   # Expected center of horizontal iris ratio
-IRIS_H_GAIN = 3.0      # Amplify horizontal movement by this factor
-IRIS_V_CENTER = 0.50
-IRIS_V_GAIN = 2.0
-
-# ── Dwell Selection ───────────────────────────────────────────────────
-DWELL_THRESHOLD = 35   # Frames (~1.2s) of continuous gaze to select a key
-KEY_HIT_MARGIN = 15    # Pixels to expand each key's gaze hit-area
-
-# ── Virtual Keyboard ──────────────────────────────────────────────────
-KEY_LABELS = [
-    'A', 'B', 'C', 'D', 'E',
-    'F', 'G', 'H', 'I', 'J',
-    'K', 'L', 'M', 'N', 'O',
-    'P', 'Q', 'R', 'S', 'T',
-    'U', 'V', 'W', 'X', 'Y',
-    'Z', 'SPACE', 'BACK', 'SPEAK', 'CLR',
-]
-KEYBOARD_COLS = 5
-KEY_SIZE = (120, 90)
-SPECIAL_KEY_SIZE = (120, 90)
-SPECIAL_KEYS = {'SPACE', 'BACK', 'SPEAK', 'CLR'}
-
-# ── Word Prediction ───────────────────────────────────────────────────
-NUM_PREDICTIONS = 3
-COMMON_WORDS = [
-    "THE", "BE", "TO", "OF", "AND", "A", "IN", "THAT", "HAVE", "I",
-    "IT", "FOR", "NOT", "ON", "WITH", "HE", "AS", "YOU", "DO", "AT",
-    "THIS", "BUT", "HIS", "BY", "FROM", "THEY", "WE", "SAY", "HER", "SHE",
-    "OR", "AN", "WILL", "MY", "ONE", "ALL", "WOULD", "THERE", "THEIR", "WHAT",
-    "SO", "UP", "OUT", "IF", "ABOUT", "WHO", "GET", "WHICH", "GO", "ME",
-    "WHEN", "MAKE", "CAN", "LIKE", "TIME", "NO", "JUST", "HIM", "KNOW", "TAKE",
-    "PEOPLE", "INTO", "YEAR", "YOUR", "GOOD", "SOME", "COULD", "THEM", "SEE", "OTHER",
-    "THAN", "THEN", "NOW", "LOOK", "ONLY", "COME", "ITS", "OVER", "THINK", "ALSO",
-    "BACK", "AFTER", "USE", "TWO", "HOW", "OUR", "WORK", "FIRST", "WELL", "WAY",
-    "EVEN", "NEW", "WANT", "BECAUSE", "ANY", "THESE", "GIVE", "DAY", "MOST", "US",
-    "YES", "NO", "HELLO", "PLEASE", "THANK", "HELP", "SORRY", "NEED", "WATER", "FOOD",
+# QWERTY  — 6 rows × 10 cols
+QWERTY_GRID = [
+    ['1',  '2',  '3',  '4',  '5',  '6',  '7',  '8',  '9',  '0' ],
+    ['Q',  'W',  'E',  'R',  'T',  'Y',  'U',  'I',  'O',  'P' ],
+    ['A',  'S',  'D',  'F',  'G',  'H',  'J',  'K',  'L',  '?' ],
+    ['Z',  'X',  'C',  'V',  'B',  'N',  'M',  '<',  '>',  'BP'],
+    ['+',  '-',  ',',  '.',  '/',  '*',  '!',  ' ',  'DL', 'PL'],
+    ['P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8', 'P9', 'P10'],
 ]
 
-# ── TTS ────────────────────────────────────────────────────────────────
-TTS_RATE = 150
+# AAC  — 8 rows × 6 cols
+# Rows 0-1: large phrase buttons
+# Rows 2-6: frequency-ordered letters (E T A O I N … Z)
+# Row 7:    special / control keys
+AAC_GRID = [
+    ['YES',   'NO',    'HELP',  'PAIN',  'WATER', 'TOILET'],
+    ['MORE',  'STOP',  'HUNGRY','TIRED', 'OKAY',  'DOCTOR'],
+    ['E',     'T',     'A',     'O',     'I',     'N'     ],
+    ['S',     'H',     'R',     'D',     'L',     'C'     ],
+    ['U',     'M',     'F',     'P',     'G',     'W'     ],
+    ['Y',     'B',     'V',     'K',     'X',     'J'     ],
+    ['Q',     'Z',     '?',     ',',     '.',     '!'     ],
+    ['SPACE', 'NUM',   'BP',    'DL',    'PL',    'SWAP'  ],
+]
+
+AAC_PHRASE_ROWS = {0, 1}    # rendered at 2× row height
+AAC_SPECIAL_ROW = 7         # rendered at 1.2× height
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PHRASES  (AAC quick-access + QWERTY P1-P10)
+# ─────────────────────────────────────────────────────────────────────────────
+PHRASES = {
+    # AAC top-row phrases
+    'YES':    "Yes",
+    'NO':     "No",
+    'HELP':   "I need help",
+    'PAIN':   "I am in pain",
+    'WATER':  "I want water",
+    'TOILET': "I want to go to the washroom",
+    'MORE':   "I want more",
+    'STOP':   "Please stop",
+    'HUNGRY': "I am hungry",
+    'TIRED':  "I am tired",
+    'OKAY':   "I am okay",
+    'DOCTOR': "Please call a doctor",
+    # QWERTY P-keys
+    'P1':  "I'm hungry",       'P2':  "I want water",
+    'P3':  "I'm satisfied",    'P4':  "I'm not satisfied",
+    'P5':  "I want to go to the washroom",
+    'P6':  "Can anyone come over here?",
+    'P7':  "Could you read something for me?",
+    'P8':  "Can we talk a little bit?",
+    'P9':  "Can I get more",   'P10': "Thank you",
+    # Control aliases
+    'SPACE': ' ',
+    'SWAP':  '__SWAP__',
+    'NUM':   '__NUM__',
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  AAC WORD PREDICTION VOCABULARY  (AAC-specific, frequency-ordered)
+# ─────────────────────────────────────────────────────────────────────────────
+AAC_VOCAB = sorted(set([
+    "I","am","want","need","help","please","thank","you","yes","no","okay",
+    "more","stop","hurt","pain","tired","hungry","thirsty","hot","cold",
+    "comfortable","uncomfortable","ready","done","again","wait","hurry",
+    "water","food","medicine","doctor","nurse","toilet","bathroom","bed",
+    "pillow","blanket","phone","call","read","write","listen","sleep","wake",
+    "happy","sad","scared","confused","bored","lonely","anxious","better",
+    "worse","good","bad","fine","sick","dizzy","nauseous",
+    "sit","stand","walk","move","turn","lift","hold","put","get","go",
+    "come","look","see","hear","feel","talk","speak","sign",
+    "the","a","in","on","at","to","of","and","but","or","not","can",
+    "will","would","could","should","have","has","had","is","are","was",
+    "my","your","his","her","their","our","this","that","here","there",
+    "what","who","when","where","why","how","much","many","some","all",
+]))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  WINDOW / GRID GEOMETRY
+# ─────────────────────────────────────────────────────────────────────────────
+KBD_WIN_W = MONITOR_WIDTH
+KBD_WIN_H = MONITOR_HEIGHT
+GRID_X    = 16
+GRID_Y    = 38
+GRID_W    = KBD_WIN_W - 32
+GRID_H    = int(KBD_WIN_H * 0.60)
+TEXT_Y    = GRID_Y + GRID_H + 18
+TEXT_H    = 60
+SUGG_Y    = TEXT_Y + TEXT_H + 8
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GAZE PIPELINE TUNING
+# ─────────────────────────────────────────────────────────────────────────────
+# Adaptive filter
+FILTER_ALPHA_SACCADE   = 0.08
+FILTER_ALPHA_FIXATION  = 0.55
+FILTER_SACCADE_THRESH  = 0.10
+FILTER_FIXATION_THRESH = 0.025
+
+# Fixation detector (I-DT)
+FIXATION_WINDOW        = 18
+FIXATION_DISP_MAX      = 0.028
+FIXATION_SPEED_MAX     = 0.045
+FIXATION_MIN_SAMPLES   = 8
+
+# Dwell controller
+DWELL_TIME             = 1.3    # seconds of accumulated fixation to fire
+DWELL_COOLDOWN         = 0.9    # min gap between same-key activations
+DWELL_CONFIRM_FRAMES   = 5      # hysteresis: frames before hover switches
+
+# Blink detector
+BLINK_EAR_THRESH       = 0.21   # Eye Aspect Ratio closed threshold
+BLINK_MIN_MS           = 150    # min closed duration (intentional)
+BLINK_MAX_MS           = 500    # max closed duration (above = hold)
+BLINK_DOUBLE_GAP_MS    = 700    # window for double-blink detection
+
+# Scanner
+SCAN_ROW_RATE          = 1.5    # seconds per row
+SCAN_COL_RATE          = 1.2    # seconds per column
+
+# Calibration (corner)
+CALIB_STABLE_DISP_MAX  = 0.025
+CALIB_STABLE_WINDOW    = 30
+CALIB_MIN_STABLE       = 8
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  3D TRACKER / ORBIT
+# ─────────────────────────────────────────────────────────────────────────────
+BASE_RADIUS  = 20               # eyeball sphere radius at calibration
+
+# Orbit debug camera defaults
+ORBIT_YAW    = math.radians(-151.0)
+ORBIT_PITCH  = 0.0
+ORBIT_RADIUS = 1500.0
+ORBIT_FOV    = 50.0
+
+# MediaPipe: nose landmark indices (PCA head pose)
+NOSE_IDX = [4,45,275,220,440,1,5,51,281,44,274,241,
+            461,125,354,218,438,195,167,393,165,391,3,248]
+
+# MediaPipe: EAR landmark indices (blink detection)
+LEFT_EYE_EAR  = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE_EAR = [33,  160, 158, 133, 153, 144]
