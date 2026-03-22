@@ -1,607 +1,426 @@
-"""EyeWave Interface Module — Virtual keyboard and calibration overlay.
+"""
+interface.py
+============
+LayoutManager  — manages QWERTY / AAC grid, switching, key lookup
+EyeKeyboard    — all OpenCV rendering and typed-text state
 
-Contains:
-  - WordPredictor:       Simple prefix-based word suggestions.
-  - CalibrationOverlay:  Full-screen overlay that guides calibration.
-  - VirtualKeyboard:     Gaze-controlled on-screen keyboard.
+No gaze logic lives here.  All selection events arrive via activate_key().
 """
 
-from PyQt5.QtWidgets import (
-    QApplication, QWidget, QGridLayout, QPushButton, QLabel,
-    QVBoxLayout, QHBoxLayout, QSlider, QFrame, QDialog, QDialogButtonBox,
+import time
+
+import cv2
+import numpy as np
+
+try:
+    import pyttsx3
+    TTS_OK = True
+except ImportError:
+    TTS_OK = False
+
+try:
+    import winsound          # Windows click sound
+    WINSOUND_OK = True
+except ImportError:
+    WINSOUND_OK = False
+
+import threading
+
+from src.config import (
+    QWERTY_GRID, AAC_GRID,
+    AAC_PHRASE_ROWS, AAC_SPECIAL_ROW,
+    PHRASES, AAC_VOCAB,
+    KBD_WIN_W, KBD_WIN_H,
+    GRID_X, GRID_Y, GRID_W, GRID_H,
+    TEXT_Y, TEXT_H, SUGG_Y,
+    CLICK_SOUND,
 )
-from PyQt5.QtCore import Qt, QRect, QPoint, QTimer
-from PyQt5.QtGui import QPainter, QColor, QPen, QBrush, QRadialGradient, QFont
-import pyttsx3
-
-from .config import (
-    KEY_LABELS, KEYBOARD_COLS, KEY_SIZE, SPECIAL_KEY_SIZE, SPECIAL_KEYS,
-    DWELL_THRESHOLD, KEY_HIT_MARGIN, NUM_PREDICTIONS, COMMON_WORDS,
-    CALIBRATION_POINTS, CALIBRATION_SAMPLES_PER_POINT, TTS_RATE,
+from src.visionc import (
+    SmartDwellController,
+    ScanningController,
+    BlinkDetector,
+    FixationDetector,
+    AdaptiveGazeFilter,
+    MultiPointCalib,
 )
+from src.utils import GazeDataCollector
+
+import os
 
 
-# ════════════════════════════════════════════════════════════════════════
-#  Word Predictor
-# ════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+#  LAYOUT MANAGER
+# ═══════════════════════════════════════════════════════════════════════════
 
-class WordPredictor:
-    """Prefix-based word prediction from a common-word list."""
-
-    def __init__(self):
-        self.common_words = COMMON_WORDS
-
-    def get_predictions(self, current_word, num=NUM_PREDICTIONS):
-        if not current_word:
-            return []
-        upper = current_word.upper()
-        return [w for w in self.common_words if w.startswith(upper)][:num]
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  Calibration Overlay (full-screen)
-# ════════════════════════════════════════════════════════════════════════
-
-class CalibrationOverlay(QWidget):
-    """Full-screen calibration widget.
-
-    Uses QWidget instead of QDialog to avoid QDialog's built-in keyboard
-    handling (spacebar/enter activating buttons, escape closing).
-    Shows calibration dots one-by-one. The user fixates on each dot while
-    the system collects eye-feature samples. When done it emits the
-    collected (features, screen_target) pairs so EyeTracker can fit.
+class LayoutManager:
+    """
+    Manages the active keyboard layout (QWERTY or AAC) and provides
+    helpers for key lookup and row classification.
     """
 
-    from PyQt5.QtCore import pyqtSignal
-    finished = pyqtSignal(int)  # 1 = accepted, 0 = rejected
-
-    def __init__(self, parent=None):
-        super().__init__(parent, Qt.Window)
-        self.setWindowTitle("EyeWave -- Calibration")
-
-        self._points = list(CALIBRATION_POINTS)
-        self._current_idx = 0
-        self._samples_per_point = CALIBRATION_SAMPLES_PER_POINT
-
-        # Collected data
-        self._current_features = []       # features for the current point
-        self._all_features = []           # flat list of all feature vectors
-        self._all_targets = []            # corresponding (x, y) screen targets
-
-        self._collecting = False
-        self._done = False
-
-        self._init_ui()
-
-    # ── UI ──────────────────────────────────────────────────────────────
-
-    def _init_ui(self):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        self.instruction = QLabel(
-            "Look at the RED dot and press SPACEBAR to start collecting.\n"
-            "Keep looking until the green ring completes."
-        )
-        self.instruction.setStyleSheet(
-            "font-size: 20px; padding: 15px; font-weight: bold; color: #ecf0f1;"
-        )
-        self.instruction.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.instruction)
-
-        # Spacer to push progress label to bottom — dots are painted on dialog itself
-        layout.addStretch(1)
-
-        # Progress
-        label = self._points[0][2] if self._points else ""
-        self.progress = QLabel(f"Point 1/{len(self._points)}  --  {label}  |  Press SPACEBAR")
-        self.progress.setStyleSheet("font-size: 15px; color: #bdc3c7; font-weight: bold;")
-        self.progress.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.progress)
-
-        # Cancel button (must NOT accept keyboard focus, otherwise spacebar closes it)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setFocusPolicy(Qt.NoFocus)  # Prevent spacebar from activating it
-        cancel_btn.setStyleSheet(
-            "color: #ecf0f1; background-color: #e74c3c; padding: 8px 20px; "
-            "border-radius: 4px; font-size: 13px;"
-        )
-        cancel_btn.clicked.connect(self.reject)
-        layout.addWidget(cancel_btn)
-
-        self.setLayout(layout)
-        self.setStyleSheet("background-color: #0f0f23;")
-        self.setFocusPolicy(Qt.StrongFocus)  # Dialog itself accepts keyboard focus
-        self.setFocus()  # Ensure dialog has focus, not any child widget
-        self.showMaximized()
-
-    # ── Input ───────────────────────────────────────────────────────────
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Space:
-            if not self._collecting and not self._done:
-                self._collecting = True
-                self._current_features = []
-                name = self._points[self._current_idx][2]
-                self.instruction.setText(f"KEEP LOOKING at the dot!  ({name})")
-                self.progress.setText(
-                    f"Point {self._current_idx + 1}/{len(self._points)}  --  Collecting..."
-                )
-            event.accept()  # Consume spacebar — do NOT pass to QDialog
-            return
-        elif event.key() == Qt.Key_Escape and self._collecting:
-            event.accept()  # Don't close while collecting
-            return
-        super().keyPressEvent(event)
-
-    # ── Drawing ─────────────────────────────────────────────────────────
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if self._done or self._current_idx >= len(self._points):
-            return
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        tx, ty, _ = self._points[self._current_idx]
-
-        # Draw area: full dialog with margins for instruction/progress labels
-        margin_top = 80
-        margin_bottom = 80
-        draw_w = self.width()
-        draw_h = self.height() - margin_top - margin_bottom
-
-        cx = int(tx * draw_w)
-        cy = int(margin_top + ty * draw_h)
-
-        # Outer glow
-        for i in range(3):
-            alpha = 40 - i * 12
-            r = 45 + i * 15
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(QColor(231, 76, 60, alpha)))
-            painter.drawEllipse(QPoint(cx, cy), r, r)
-
-        # Main dot
-        painter.setBrush(QBrush(QColor(231, 76, 60)))
-        painter.setPen(QPen(QColor(192, 57, 43), 3))
-        painter.drawEllipse(QPoint(cx, cy), 28, 28)
-
-        # White center
-        painter.setBrush(QBrush(QColor(255, 255, 255)))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(QPoint(cx, cy), 6, 6)
-
-        # Progress ring
-        if self._collecting and self._current_features:
-            frac = len(self._current_features) / self._samples_per_point
-            painter.setPen(QPen(QColor(46, 204, 113), 5))
-            painter.setBrush(Qt.NoBrush)
-            span = -int(360 * 16 * frac)
-            painter.drawArc(cx - 45, cy - 45, 90, 90, 90 * 16, span)
-
-            # Percentage
-            painter.setPen(QPen(QColor(255, 255, 255)))
-            painter.setFont(QFont("Arial", 11))
-            painter.drawText(cx - 15, cy + 65, f"{int(frac * 100)}%")
-
-    # ── Data Collection ─────────────────────────────────────────────────
-
-    def add_features(self, features):
-        """Called every frame by the main loop while calibrating."""
-        if not self._collecting or features is None:
-            return
-
-        self._current_features.append(features.copy())
-
-        if len(self._current_features) >= self._samples_per_point:
-            tx, ty, name = self._points[self._current_idx]
-
-            # Convert the drawn dot position to normalized *screen* coordinates.
-            # paintEvent draws with margin_top/bottom=80 inside the overlay, so
-            # the dot's true pixel position on the overlay is:
-            #   dot_x = tx * overlay_width
-            #   dot_y = margin_top + ty * (overlay_height - margin_top - margin_bottom)
-            # We then map that to global screen coords for a proper target.
-            margin_top = 80
-            margin_bottom = 80
-            overlay_w = self.width()
-            overlay_h = self.height()
-            draw_h = overlay_h - margin_top - margin_bottom
-
-            dot_local_x = int(tx * overlay_w)
-            dot_local_y = int(margin_top + ty * draw_h)
-
-            global_pt = self.mapToGlobal(QPoint(dot_local_x, dot_local_y))
-            screen = QApplication.primaryScreen().geometry()
-            target_x = global_pt.x() / screen.width()
-            target_y = global_pt.y() / screen.height()
-
-            # Store all individual samples with the actual screen target
-            for feat in self._current_features:
-                self._all_features.append(feat)
-                self._all_targets.append((target_x, target_y))
-
-            self._current_idx += 1
-            self._current_features = []
-            self._collecting = False
-
-            if self._current_idx < len(self._points):
-                next_name = self._points[self._current_idx][2]
-                self.instruction.setText(
-                    f"Good!  Now look at the next dot.\n"
-                    f"Press SPACEBAR when ready for: {next_name}"
-                )
-                self.progress.setText(
-                    f"Point {self._current_idx + 1}/{len(self._points)}  —  Press SPACEBAR"
-                )
-            else:
-                self._done = True
-                self.instruction.setText("✓  Calibration complete!")
-                self.progress.setText("All points collected — closing…")
-                QTimer.singleShot(1200, self.accept)
-
-        self.update()
-
-    def get_calibration_data(self):
-        """Return (features_list, targets_list) collected during calibration."""
-        return self._all_features, self._all_targets
-
-    def accept(self):
-        """Mimic QDialog.accept() — emit finished(1) and close."""
-        self.finished.emit(1)
-        self.close()
-
-    def reject(self):
-        """Mimic QDialog.reject() — emit finished(0) and close."""
-        self.finished.emit(0)
-        self.close()
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  Virtual Keyboard
-# ════════════════════════════════════════════════════════════════════════
-
-class VirtualKeyboard(QWidget):
-    """Gaze-controlled virtual keyboard with word prediction."""
+    LAYOUT_QWERTY = 'qwerty'
+    LAYOUT_AAC    = 'aac'
 
     def __init__(self):
-        super().__init__()
-        self.keys_widgets = []
-        self.key_rects = []
-        self.current_focused_key = None
-        self.dwell_time = 0
-        self.dwell_threshold = DWELL_THRESHOLD
+        self.current = self.LAYOUT_QWERTY
 
-        self.engine = pyttsx3.init()
-        self.engine.setProperty("rate", TTS_RATE)
+    def toggle(self):
+        self.current = (self.LAYOUT_AAC
+                        if self.current == self.LAYOUT_QWERTY
+                        else self.LAYOUT_QWERTY)
 
-        self.predictor = WordPredictor()
-        self.prediction_buttons = []
+    @property
+    def grid(self):
+        return QWERTY_GRID if self.current == self.LAYOUT_QWERTY else AAC_GRID
 
-        self.gaze_x = 0.5
-        self.gaze_y = 0.5
-        self.show_gaze_cursor = True
+    @property
+    def rows(self) -> int:
+        return len(self.grid)
 
-        self._init_ui()
+    @property
+    def cols(self) -> int:
+        return len(self.grid[0])
 
-    # ── UI ──────────────────────────────────────────────────────────────
+    @property
+    def is_aac(self) -> bool:
+        return self.current == self.LAYOUT_AAC
 
-    def _init_ui(self):
-        main = QVBoxLayout()
+    def key_at(self, row: int, col: int) -> str | None:
+        g = self.grid
+        if 0 <= row < len(g) and 0 <= col < len(g[row]):
+            return g[row][col]
+        return None
 
-        # Text display
-        self.text_display = QLabel("")
-        self.text_display.setStyleSheet("""
-            font-size: 36px; border: 3px solid #2c3e50;
-            padding: 15px; background-color: white; min-height: 80px;
-        """)
-        self.text_display.setWordWrap(True)
-        main.addWidget(self.text_display)
+    def is_phrase_row(self, row: int) -> bool:
+        return self.is_aac and row in AAC_PHRASE_ROWS
 
-        # Predictions
-        pred_layout = QHBoxLayout()
-        pred_layout.addWidget(self._styled_label("Suggestions:", 18, True))
-        for _ in range(NUM_PREDICTIONS):
-            btn = QPushButton("")
-            btn.setFixedHeight(50)
-            btn.setStyleSheet(self._pred_style(False, 0))
-            btn.hide()
-            self.prediction_buttons.append(btn)
-            pred_layout.addWidget(btn)
-        pred_layout.addStretch()
-        main.addLayout(pred_layout)
+    def is_special_row(self, row: int) -> bool:
+        return self.is_aac and row == AAC_SPECIAL_ROW
 
-        # Status
-        status_layout = QHBoxLayout()
-        self.status_label = QLabel("Look at a key to select • Calibrate first")
-        self.status_label.setStyleSheet("font-size: 14px; color: #7f8c8d;")
-        status_layout.addWidget(self.status_label)
-        self.dwell_indicator = QLabel("")
-        self.dwell_indicator.setFixedSize(150, 15)
-        self.dwell_indicator.setStyleSheet("border: 2px solid #bdc3c7; background-color: #ecf0f1;")
-        status_layout.addWidget(self.dwell_indicator)
-        main.addLayout(status_layout)
 
-        # Debug
-        self.debug_label = QLabel("Gaze: 0.50, 0.50")
-        self.debug_label.setStyleSheet("font-size: 11px; color: #95a5a6;")
-        main.addWidget(self.debug_label)
+# ═══════════════════════════════════════════════════════════════════════════
+#  EYE KEYBOARD  (rendering + text state)
+# ═══════════════════════════════════════════════════════════════════════════
 
-        # Keyboard grid
-        grid = QGridLayout()
-        grid.setSpacing(6)
-        row, col = 0, 0
-        for label in KEY_LABELS:
-            btn = QPushButton(label)
-            sz = SPECIAL_KEY_SIZE if label in SPECIAL_KEYS else KEY_SIZE
-            btn.setFixedSize(*sz)
-            btn.setStyleSheet(self._key_style(False, 0))
-            grid.addWidget(btn, row, col)
-            self.keys_widgets.append(btn)
-            col += 1
-            if col >= KEYBOARD_COLS:
-                col = 0
-                row += 1
-        main.addLayout(grid)
+class EyeKeyboard:
+    """
+    Owns the typed text buffer, word suggestions, flash state, and all
+    OpenCV rendering.  Selection logic (dwell / scan / blink) lives in
+    the pipeline classes; this class only processes activate_key() calls.
+    """
 
-        # Buttons row
-        btn_row = QHBoxLayout()
-        self.cal_btn = QPushButton("🎯 Run Calibration")
-        self.cal_btn.setStyleSheet("""
-            font-size: 14px; font-weight: bold;
-            background-color: #e74c3c; color: white;
-            padding: 10px; border-radius: 5px;
-        """)
-        btn_row.addWidget(self.cal_btn)
+    def __init__(self):
+        self.typed_text  = ""
+        self.suggestions = []
+        self.flash_key   = None
+        self.flash_end   = 0.0
+        self.status      = "Press C to calibrate (loads saved if available)."
 
-        self.toggle_cursor_btn = QPushButton("👁 Toggle Gaze Cursor")
-        self.toggle_cursor_btn.setStyleSheet("""
-            font-size: 14px; background-color: #3498db;
-            color: white; padding: 10px; border-radius: 5px;
-        """)
-        self.toggle_cursor_btn.clicked.connect(self._toggle_cursor)
-        btn_row.addWidget(self.toggle_cursor_btn)
+    # ── Key activation ────────────────────────────────────────────────────
 
-        main.addLayout(btn_row)
-
-        self.setLayout(main)
-        self.setWindowTitle("EyeWave — Gaze-Controlled Keyboard")
-        self.setGeometry(50, 50, 800, 900)
-
-    # ── Gaze painting ───────────────────────────────────────────────────
-
-    def _gaze_to_local(self, gx, gy):
-        """Convert normalized screen gaze (0-1) to widget-local pixel coords.
-
-        Calibration targets are in normalized *screen* coordinates, so we must
-        first map to absolute screen pixels, then convert to the widget's
-        local coordinate system. This ensures alignment regardless of window
-        size, position, or fullscreen state.
+    def activate_key(self, kp: tuple, layout: LayoutManager):
         """
-        screen = QApplication.primaryScreen().geometry()
-        screen_x = int(gx * screen.width())
-        screen_y = int(gy * screen.height())
-        local = self.mapFromGlobal(QPoint(screen_x, screen_y))
-        return local.x(), local.y()
+        Process one key activation.
 
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.show_gaze_cursor:
+        Returns
+        -------
+        '__SWAP__'  — caller should toggle layout
+        key string  — the character(s) appended / action taken
+        False       — cell out of range
+        """
+        r, c = kp
+        key  = layout.key_at(r, c)
+        if key is None:
+            return False
+
+        self.flash_key = kp
+        self.flash_end = time.time() + 0.35
+        self._play_click()
+
+        # Internal routing
+        if key == '__SWAP__' or key == 'SWAP':
+            return '__SWAP__'
+
+        # Control keys
+        if   key == 'BP':    self.typed_text = self.typed_text[:-1]
+        elif key == 'DL':    self.typed_text = ""
+        elif key == 'PL':    self._speak(self.typed_text.strip())
+        elif key in PHRASES:
+            val = PHRASES[key]
+            if val.startswith('__'):
+                return val                      # pass internal commands up
+            # Full phrase → replace text and speak; single char → append
+            if len(val) > 2:
+                self.typed_text = val
+                self._speak(val)
+            else:
+                self.typed_text += val
+        elif key == 'SPACE': self.typed_text += ' '
+        elif key == 'NUM':   pass               # future: number pad
+        else:                self.typed_text += key
+
+        self._update_suggestions()
+        return key
+
+    def _update_suggestions(self):
+        parts  = self.typed_text.split()
+        prefix = parts[-1].lower() if parts else ""
+        self.suggestions = ([w for w in AAC_VOCAB if w.startswith(prefix)][:5]
+                            if prefix else [])
+
+    def _speak(self, text: str):
+        if not text or not TTS_OK:
             return
+        def _do():
+            try:
+                e = pyttsx3.init()
+                e.say(text)
+                e.runAndWait()
+            except Exception as ex:
+                print(f"[TTS] {ex}")
+        threading.Thread(target=_do, daemon=True).start()
 
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        sx, sy = self._gaze_to_local(self.gaze_x, self.gaze_y)
+    def _play_click(self):
+        """Play a short click sound on key activation."""
+        if os.path.exists(CLICK_SOUND):
+            try:
+                if WINSOUND_OK:
+                    winsound.PlaySound(CLICK_SOUND,
+                                       winsound.SND_FILENAME | winsound.SND_ASYNC)
+            except Exception:
+                pass
 
-        # Gradient glow
-        g = QRadialGradient(sx, sy, 30)
-        g.setColorAt(0, QColor(52, 152, 219, 100))
-        g.setColorAt(0.7, QColor(52, 152, 219, 50))
-        g.setColorAt(1, QColor(52, 152, 219, 0))
-        painter.setBrush(QBrush(g))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(QPoint(sx, sy), 30, 30)
+    # ── Master draw entry point ───────────────────────────────────────────
 
-        # Crosshair
-        painter.setPen(QPen(QColor(41, 128, 185), 3))
-        painter.drawLine(sx - 20, sy, sx + 20, sy)
-        painter.drawLine(sx, sy - 20, sx, sy + 20)
+    def draw(self,
+             layout:      LayoutManager,
+             dwell:       SmartDwellController,
+             scanner:     ScanningController,
+             blinker:     BlinkDetector,
+             fixation:    FixationDetector,
+             gaze_filter: AdaptiveGazeFilter,
+             calib:       MultiPointCalib,
+             collector:   GazeDataCollector,
+             sel_mode:    str) -> np.ndarray:
+        """Render a complete keyboard frame and return it."""
+        frame = np.zeros((KBD_WIN_H, KBD_WIN_W, 3), dtype=np.uint8)
+        frame[:] = (8, 8, 12)
 
-        # Center dot
-        painter.setBrush(QBrush(QColor(231, 76, 60)))
-        painter.setPen(QPen(QColor(192, 57, 43), 2))
-        painter.drawEllipse(QPoint(sx, sy), 6, 6)
+        self._draw_topbar(frame, layout, blinker, calib,
+                          fixation, collector, sel_mode)
+        self._draw_grid(frame, layout, dwell, scanner, sel_mode)
+        self._draw_textbox(frame)
+        self._draw_suggestions(frame)
+        self._draw_cursors(frame, dwell, fixation, gaze_filter)
+        return frame
 
-    # ── Gaze update ─────────────────────────────────────────────────────
+    # ── Top status bar ────────────────────────────────────────────────────
 
-    def update_key_positions(self):
-        self.key_rects = []
-        m = KEY_HIT_MARGIN
-        for btn in self.keys_widgets:
-            pos = btn.mapToGlobal(btn.rect().topLeft())
-            local = self.mapFromGlobal(pos)
-            # Expand hit area by margin for easier gaze targeting
-            self.key_rects.append(QRect(
-                local.x() - m, local.y() - m,
-                btn.width() + 2 * m, btn.height() + 2 * m))
-        for btn in self.prediction_buttons:
-            if btn.isVisible():
-                pos = btn.mapToGlobal(btn.rect().topLeft())
-                local = self.mapFromGlobal(pos)
-                self.key_rects.append(QRect(
-                    local.x() - m, local.y() - m,
-                    btn.width() + 2 * m, btn.height() + 2 * m))
+    def _draw_topbar(self, frame, layout, blinker, calib,
+                     fixation, collector, sel_mode):
+        cv2.rectangle(frame, (0, 0), (KBD_WIN_W, GRID_Y - 2), (12, 12, 20), -1)
 
-    def update_gaze(self, gx, gy):
-        self.gaze_x = gx
-        self.gaze_y = gy
-        self.update()  # repaint cursor
-
-        self.debug_label.setText(f"Gaze: {gx:.2f}, {gy:.2f}")
-
-        # Refresh key rects if needed
-        expected = len(self.keys_widgets) + sum(1 for b in self.prediction_buttons if b.isVisible())
-        if not self.key_rects or len(self.key_rects) != expected:
-            self.update_key_positions()
-
-        sx, sy = self._gaze_to_local(gx, gy)
-
-        focused_idx = None
-        is_pred = False
-
-        for idx, rect in enumerate(self.key_rects[:len(self.keys_widgets)]):
-            if rect.contains(sx, sy):
-                focused_idx = idx
-                break
-        if focused_idx is None:
-            offset = len(self.keys_widgets)
-            for idx, rect in enumerate(self.key_rects[offset:]):
-                if rect.contains(sx, sy):
-                    focused_idx = idx
-                    is_pred = True
-                    break
-
-        if focused_idx is not None:
-            key_id = (focused_idx, is_pred)
-            if key_id == self.current_focused_key:
-                self.dwell_time += 1
-                prog = min(1.0, self.dwell_time / self.dwell_threshold)
-                if is_pred:
-                    self._style_preds(focused_idx, prog)
-                else:
-                    self._style_keys(focused_idx, prog)
-                self._dwell_bar(prog)
-                if self.dwell_time >= self.dwell_threshold:
-                    if is_pred:
-                        self.select_prediction(focused_idx)
-                    else:
-                        self.select_key(focused_idx)
-                    self.dwell_time = 0
-                    self.current_focused_key = None
-            else:
-                self.current_focused_key = key_id
-                self.dwell_time = 1
-                if is_pred:
-                    self._style_preds(focused_idx, 0)
-                else:
-                    self._style_keys(focused_idx, 0)
+        if calib.active and calib.current_label:
+            n   = calib.stable_count
+            bar = min(n, calib.MIN_STABLE)
+            msg = (f"  Look at {calib.current_label}  "
+                   f"({bar}/{calib.MIN_STABLE} stable) → SPACE to confirm")
+            cv2.putText(frame, msg, (6, GRID_Y - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                        (0, 220, 255), 1, cv2.LINE_AA)
         else:
-            self.dwell_time = 0
-            self.current_focused_key = None
-            self._style_keys(None, 0)
-            self._style_preds(None, 0)
-            self._dwell_bar(0)
+            cv2.putText(frame, self.status, (6, GRID_Y - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46,
+                        (110, 110, 140), 1, cv2.LINE_AA)
 
-    # ── Selection ───────────────────────────────────────────────────────
+        # Right-side badges
+        badges = []
+        if calib.ready:
+            badges.append(("4pt✓", (60, 220, 80)))
+        elif calib.active:
+            n = sum(1 for p in calib.raw_pts if p is not None)
+            badges.append((f"calib{n}/4", (0, 200, 255)))
 
-    def select_key(self, idx):
-        char = KEY_LABELS[idx]
-        text = self.text_display.text()
-        if char == "SPACE":
-            self.text_display.setText(text + " ")
-        elif char == "BACK":
-            self.text_display.setText(text[:-1])
-        elif char == "CLR":
-            self.text_display.setText("")
-        elif char == "SPEAK":
-            if text:
-                self.engine.say(text)
-                self.engine.runAndWait()
+        badges.append((
+            "SCAN" if sel_mode == 'scan' else "GAZE",
+            (0, 200, 255) if sel_mode == 'scan' else (200, 200, 0)
+        ))
+        badges.append((layout.current.upper(), (180, 120, 255)))
+        if blinker.enabled:
+            badges.append(("BLINK", (0, 255, 180)))
+        badges.append((f"data:{collector.count}", (100, 100, 100)))
+
+        bx = KBD_WIN_W - 12
+        for txt, col in reversed(badges):
+            tw, _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0]
+            bx   -= tw + 14
+            cv2.putText(frame, txt, (bx, GRID_Y - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1, cv2.LINE_AA)
+
+        # Fixation dot
+        fix_col = (0, 255, 120) if fixation.is_fixating else (60, 60, 60)
+        cv2.circle(frame, (KBD_WIN_W - 8, GRID_Y - 12), 6, fix_col, -1)
+
+    # ── Grid ──────────────────────────────────────────────────────────────
+
+    def _key_dims(self, layout: LayoutManager, row: int, col: int):
+        """Return (x1,y1,x2,y2) for a grid cell, with AAC variable row heights."""
+        if layout.is_aac:
+            ph  = len(AAC_PHRASE_ROWS)
+            lr  = layout.rows - ph - 1         # letter rows
+            total_u = ph * 2 + lr * 1 + 1 * 1.2
+            unit_h  = GRID_H / total_u
+
+            def row_u(r):
+                return (2.0 if r in AAC_PHRASE_ROWS
+                        else 1.2 if r == AAC_SPECIAL_ROW
+                        else 1.0)
+
+            y_off = sum(row_u(r) for r in range(row)) * unit_h
+            y1 = GRID_Y + int(y_off)
+            y2 = GRID_Y + int(y_off + row_u(row) * unit_h) - 2
         else:
-            self.text_display.setText(text + char)
-        self._update_predictions()
-        self.status_label.setText(f"Selected: {char}")
+            kh = GRID_H // layout.rows
+            y1 = GRID_Y + row * kh
+            y2 = y1 + kh - 2
 
-    def select_prediction(self, idx):
-        if idx < len(self.prediction_buttons) and self.prediction_buttons[idx].isVisible():
-            word = self.prediction_buttons[idx].text()
-            text = self.text_display.text()
-            words = text.split()
-            if words:
-                words[-1] = word
-                self.text_display.setText(" ".join(words) + " ")
-            else:
-                self.text_display.setText(word + " ")
-            self._update_predictions()
-            self.status_label.setText(f"Selected word: {word}")
+        kw = GRID_W // layout.cols
+        x1 = GRID_X + col * kw
+        x2 = x1 + kw - 2
+        return x1, y1, x2, y2
 
-    def reset_dwell(self):
-        self.dwell_time = 0
-        self.current_focused_key = None
+    def _draw_grid(self, frame, layout, dwell, scanner, sel_mode):
+        now = time.time()
+        dp  = dwell.dwell_progress
+        hov = dwell.hovered if sel_mode == 'gaze' else None
+        hov_col = hov[1] if hov else -1
 
-    # ── Helpers ─────────────────────────────────────────────────────────
+        scan_row    = scanner.scan_row if scanner.state != scanner.ST_IDLE else -1
+        scan_col    = scanner.scan_col if scanner.state == scanner.ST_COL  else -1
+        in_row_scan = scanner.state == scanner.ST_ROW
+        in_col_scan = scanner.state == scanner.ST_COL
 
-    def _toggle_cursor(self):
-        self.show_gaze_cursor = not self.show_gaze_cursor
-        self.update()
+        for r in range(layout.rows):
+            for c in range(layout.cols):
+                key = layout.key_at(r, c)
+                if key is None:
+                    continue
+                x1, y1, x2, y2 = self._key_dims(layout, r, c)
+                kw, kh = x2 - x1, y2 - y1
 
-    def _update_predictions(self):
-        text = self.text_display.text()
-        words = text.split()
-        current = words[-1] if words else ""
-        preds = self.predictor.get_predictions(current, NUM_PREDICTIONS)
-        for i, btn in enumerate(self.prediction_buttons):
-            if i < len(preds):
-                btn.setText(preds[i])
-                btn.show()
-            else:
-                btn.hide()
-        self.update_key_positions()
+                is_hov    = (hov == (r, c))
+                is_flash  = (self.flash_key == (r, c) and now < self.flash_end)
+                is_col_h  = (c == hov_col and not is_hov)
+                row_lit   = in_row_scan and r == scan_row
+                col_lit   = in_col_scan and r == scan_row and c == scan_col
 
-    def _style_keys(self, focused_idx, prog):
-        for i, btn in enumerate(self.keys_widgets):
-            btn.setStyleSheet(self._key_style(i == focused_idx, prog))
+                # Background
+                if   is_flash:  bg = (30, 200, 30)
+                elif col_lit:   bg = (0, 200, 100)
+                elif row_lit:   bg = (0, 80, 140)
+                elif is_hov:
+                    b_ = int(255 * (1 - dp))
+                    g_ = int(180 * dp)
+                    r_ = int(255 * dp)
+                    bg = (b_, g_, r_)
+                elif is_col_h:              bg = (45, 45, 80)
+                elif layout.is_phrase_row(r): bg = (28, 12, 50)
+                elif layout.is_special_row(r): bg = (12, 28, 28)
+                else:                        bg = (18, 18, 24)
 
-    def _style_preds(self, focused_idx, prog):
-        for i, btn in enumerate(self.prediction_buttons):
-            if btn.isVisible():
-                btn.setStyleSheet(self._pred_style(i == focused_idx, prog))
+                cv2.rectangle(frame, (x1, y1), (x2, y2), bg, -1)
 
-    def _dwell_bar(self, prog):
-        self.dwell_indicator.setStyleSheet(f"""
-            border: 2px solid #bdc3c7;
-            background: qlineargradient(x1:0, x2:1,
-                stop:0 #3498db, stop:{prog} #3498db,
-                stop:{prog} #ecf0f1, stop:1 #ecf0f1);
-        """)
+                # Border
+                border = ((0, 255, 150) if col_lit
+                          else (0, 150, 255) if row_lit or is_hov
+                          else (48, 48, 62))
+                cv2.rectangle(frame, (x1, y1), (x2, y2), border, 1)
 
-    @staticmethod
-    def _key_style(focused, prog):
-        if focused:
-            r = int(52 + (46 - 52) * prog)
-            g = int(152 + (204 - 152) * prog)
-            b = int(219 + (113 - 219) * prog)
-            return f"""
-                font-size: 22px; font-weight: bold;
-                background-color: rgb({r},{g},{b}); color: white;
-                border: 4px solid #2c3e50; border-radius: 8px;
-            """
-        return """
-            font-size: 20px; background-color: #ecf0f1;
-            color: #2c3e50; border: 2px solid #bdc3c7; border-radius: 6px;
+                # Label
+                fc = (0, 0, 0) if is_flash else (220, 220, 220)
+                fs = (0.60 if layout.is_phrase_row(r)
+                      else 0.38 if len(key) > 4
+                      else 0.44 if len(key) > 2
+                      else 0.58)
+                tw, th = cv2.getTextSize(key, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)[0]
+                cv2.putText(frame, key,
+                            (x1 + (kw - tw) // 2, y1 + (kh + th) // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, fs, fc, 1, cv2.LINE_AA)
+
+                # Dwell arc (gaze mode only)
+                if is_hov and dp > 0.01 and sel_mode == 'gaze':
+                    cx  = x1 + kw // 2;  cy = y1 + kh // 2
+                    rad = min(kw, kh) // 2 - 3
+                    cv2.ellipse(frame, (cx, cy), (rad, rad),
+                                -90, 0, int(360 * dp),
+                                (0, 255, 180), 2, cv2.LINE_AA)
+
+        # Scan state label
+        if scanner.state != scanner.ST_IDLE:
+            lbl = (f"SCANNING ROW {scan_row+1}/{layout.rows}"
+                   if in_row_scan
+                   else f"SCANNING COL {scan_col+1}/{layout.cols} "
+                        f"in ROW {scan_row+1}")
+            cv2.putText(frame, lbl, (GRID_X, GRID_Y + GRID_H + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 200, 255), 1, cv2.LINE_AA)
+
+    # ── Text box ──────────────────────────────────────────────────────────
+
+    def _draw_textbox(self, frame):
+        bx1, by1 = GRID_X, TEXT_Y
+        bx2, by2 = GRID_X + GRID_W, TEXT_Y + TEXT_H
+        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (20, 20, 28), -1)
+        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (65, 65, 88), 1)
+        disp = (self.typed_text[-90:]
+                if len(self.typed_text) > 90
+                else self.typed_text)
+        cv2.putText(frame, disp + "|", (bx1 + 10, by1 + 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.76,
+                    (150, 255, 150), 1, cv2.LINE_AA)
+
+    # ── Suggestions ───────────────────────────────────────────────────────
+
+    def _draw_suggestions(self, frame):
+        if not self.suggestions:
+            return
+        cv2.putText(frame, "Predict:", (GRID_X, SUGG_Y + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (100, 100, 200), 1)
+        for i, w in enumerate(self.suggestions):
+            sx = GRID_X + 82 + i * 165
+            sy = SUGG_Y
+            cv2.rectangle(frame, (sx-4, sy), (sx+154, sy+22), (32, 32, 55), -1)
+            cv2.rectangle(frame, (sx-4, sy), (sx+154, sy+22), (65, 65, 110), 1)
+            cv2.putText(frame, w, (sx, sy + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                        (255, 192, 80), 1, cv2.LINE_AA)
+
+    # ── Cursors ───────────────────────────────────────────────────────────
+
+    def _draw_cursors(self, frame, dwell, fixation, gaze_filter):
         """
-
-    @staticmethod
-    def _pred_style(focused, prog):
-        if focused:
-            r = int(52 + (46 - 52) * prog)
-            g = int(152 + (204 - 152) * prog)
-            b = int(219 + (113 - 219) * prog)
-            return f"""
-                font-size: 18px; font-weight: bold;
-                background-color: rgb({r},{g},{b}); color: white;
-                border: 3px solid #2c3e50; border-radius: 5px;
-            """
-        return """
-            font-size: 16px; background-color: #3498db;
-            color: white; border: 2px solid #2980b9; border-radius: 5px;
+        Two cursors:
+          1. Large crosshair  — smooth filter position (display)
+          2. Small green dot  — fixation centroid (only during fixation)
+             This is what actually drives dwell / scanning.
         """
+        da = float(np.clip(gaze_filter.a, 0.0, 1.0))
+        db = float(np.clip(gaze_filter.b, 0.0, 1.0))
+        gx = int(GRID_X + da * GRID_W)
+        gy = int(GRID_Y + db * GRID_H)
+        r  = 13
+        col = (0, 195, 255) if fixation.is_fixating else (0, 90, 160)
 
-    @staticmethod
-    def _styled_label(text, size, bold=False):
-        lbl = QLabel(text)
-        w = "bold" if bold else "normal"
-        lbl.setStyleSheet(f"font-size: {size}px; font-weight: {w};")
-        return lbl
+        cv2.circle(frame, (gx, gy), r, col, 1, cv2.LINE_AA)
+        cv2.circle(frame, (gx, gy), 2, col, -1)
+        cv2.line(frame, (gx-r-6, gy), (gx-r+2, gy), col, 1)
+        cv2.line(frame, (gx+r-2, gy), (gx+r+6, gy), col, 1)
+        cv2.line(frame, (gx, gy-r-6), (gx, gy-r+2), col, 1)
+        cv2.line(frame, (gx, gy+r-2), (gx, gy+r+6), col, 1)
+
+        if fixation.is_fixating:
+            fa = float(np.clip(fixation.centroid_a, 0.0, 1.0))
+            fb = float(np.clip(fixation.centroid_b, 0.0, 1.0))
+            fx = int(GRID_X + fa * GRID_W)
+            fy = int(GRID_Y + fb * GRID_H)
+            cv2.circle(frame, (fx, fy), 5, (0, 255, 180), -1, cv2.LINE_AA)
+            cv2.circle(frame, (fx, fy), 5, (255, 255, 255),  1, cv2.LINE_AA)
