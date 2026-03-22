@@ -1,344 +1,342 @@
-# EyeWave Utility Functions
+"""
+utils.py
+========
+Pure utility functions used across the pipeline:
+  - 3D math helpers (rotation matrices, normalise, focal length)
+  - PCA head-pose estimation
+  - Monitor plane creation
+  - Ray-plane intersection
+  - CalibrationManager  (save / load  calibration.json)
+  - GazeDataCollector   (append rows to  gaze_data.csv)
 
-import math
-import time
+None of these functions depend on OpenCV windows or UI state.
+"""
+
 import cv2
+import csv
+import json
+import math
+import os
+
 import numpy as np
+from scipy.spatial.transform import Rotation as Rscipy
 
+from src.config import CALIB_FILE, GAZE_DATA_FILE
 
-# ════════════════════════════════════════════════════════════════════════
-#  One Euro Filter — adaptive low-pass for noisy gaze input
-# ════════════════════════════════════════════════════════════════════════
 
-class LowPassFilter:
-    """Simple first-order low-pass filter."""
+# ─────────────────────────────────────────────────────────────────────────────
+#  ROTATION HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def __init__(self, alpha=1.0):
-        self._y = None
-        self._alpha = alpha
+def rot_x(a: float) -> np.ndarray:
+    """3×3 rotation matrix around X axis by angle a (radians)."""
+    ca, sa = math.cos(a), math.sin(a)
+    return np.array([[1, 0,  0  ],
+                     [0, ca, -sa],
+                     [0, sa,  ca]], dtype=float)
 
-    def filter(self, value, alpha=None):
-        if alpha is not None:
-            self._alpha = alpha
-        if self._y is None:
-            self._y = value
-        else:
-            self._y = self._alpha * value + (1.0 - self._alpha) * self._y
-        return self._y
 
-    def reset(self):
-        self._y = None
+def rot_y(a: float) -> np.ndarray:
+    """3×3 rotation matrix around Y axis by angle a (radians)."""
+    ca, sa = math.cos(a), math.sin(a)
+    return np.array([[ ca, 0, sa],
+                     [  0, 1,  0],
+                     [-sa, 0, ca]], dtype=float)
 
 
-class OneEuroFilter:
-    """One Euro Filter for adaptive noise reduction.
+def normalize(v: np.ndarray) -> np.ndarray:
+    """Return unit vector; returns v unchanged if near-zero."""
+    v = np.asarray(v, dtype=float)
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-9 else v
 
-    During fixations (slow movement) it smooths heavily to eliminate jitter.
-    During saccades (fast movement) it responds quickly with minimal lag.
 
-    Args:
-        freq:       Sampling frequency in Hz (e.g. 30 for 30fps).
-        min_cutoff: Minimum cutoff frequency — lower = more smoothing during fixation.
-        beta:       Speed coefficient — higher = less lag during fast movement.
-        d_cutoff:   Cutoff for derivative filtering (usually 1.0).
-    """
+def focal_px(width: int, fov_deg: float) -> float:
+    """Pinhole focal length in pixels from image width and horizontal FOV."""
+    return 0.5 * width / math.tan(math.radians(fov_deg) * 0.5)
 
-    def __init__(self, freq=30.0, min_cutoff=1.0, beta=0.007, d_cutoff=1.0):
-        self.freq = freq
-        self.min_cutoff = min_cutoff
-        self.beta = beta
-        self.d_cutoff = d_cutoff
-        self._x = LowPassFilter()
-        self._dx = LowPassFilter()
-        self._last_time = None
 
-    @staticmethod
-    def _alpha(cutoff, freq):
-        tau = 1.0 / (2.0 * math.pi * cutoff)
-        te = 1.0 / freq
-        return 1.0 / (1.0 + tau / te)
+# ─────────────────────────────────────────────────────────────────────────────
+#  SCALE ESTIMATION  (used to track head distance changes)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def filter(self, x, timestamp=None):
-        if self._last_time is not None and timestamp is not None:
-            dt = timestamp - self._last_time
-            if dt > 0:
-                self.freq = 1.0 / dt
-        self._last_time = timestamp
-
-        # Estimate derivative
-        prev = self._x._y
-        if prev is None:
-            dx = 0.0
-        else:
-            dx = (x - prev) * self.freq
-
-        # Filter the derivative
-        edx = self._dx.filter(dx, self._alpha(self.d_cutoff, self.freq))
-
-        # Adaptive cutoff: when speed is high, cutoff increases → less smoothing
-        cutoff = self.min_cutoff + self.beta * abs(edx)
-
-        return self._x.filter(x, self._alpha(cutoff, self.freq))
-
-    def reset(self):
-        self._x.reset()
-        self._dx.reset()
-        self._last_time = None
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  Simple helpers
-# ════════════════════════════════════════════════════════════════════════
-
-def ema_smooth(current: float, previous: float, alpha: float) -> float:
-    """Exponential Moving Average smoothing (legacy, use OneEuroFilter instead)."""
-    return alpha * current + (1.0 - alpha) * previous
-
-
-def normalize_to_range(value: float, src_min: float, src_max: float,
-                       dst_min: float = 0.0, dst_max: float = 1.0) -> float:
-    """Linearly map *value* from [src_min, src_max] to [dst_min, dst_max], clamped."""
-    if src_max == src_min:
-        return (dst_min + dst_max) / 2.0
-    normalized = (value - src_min) / (src_max - src_min)
-    scaled = dst_min + normalized * (dst_max - dst_min)
-    return float(np.clip(scaled, dst_min, dst_max))
-
-
-def eye_aspect_ratio(top, bottom, left, right) -> float:
-    """Compute Eye Aspect Ratio (EAR) from landmark pixel coordinates.
-
-    Each argument is an (x, y) array-like.
-    """
-    hor = math.hypot(left[0] - right[0], left[1] - right[1])
-    ver = math.hypot(top[0] - bottom[0], top[1] - bottom[1])
-    return ver / hor if hor > 0 else 0.0
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  3D Head Orientation & Gaze Helpers (from MonitorTracking.py)
-# ════════════════════════════════════════════════════════════════════════
-
-def compute_pca_orientation(pts, indices, w, h, ref_matrix):
-    """PCA-based head orientation from nose-region landmarks.
-
-    Computes a stable 3D rotation matrix using eigendecomposition of the
-    covariance matrix of selected landmarks.  A reference matrix is used
-    to stabilise eigenvector sign flips between frames.
-
-    Args:
-        pts:        (N, 2) pixel landmarks from MediaPipe.
-        indices:    List of landmark indices to use (nose region).
-        w, h:       Frame width/height.
-        ref_matrix: Single-element list [R_ref | None] — mutated in-place.
-
-    Returns:
-        (center_3d, R_final, points_3d)
-        - center_3d: (3,) mean position of selected landmarks.
-        - R_final:   (3,3) stabilised rotation matrix.
-        - points_3d: (K,3) 3D positions of all selected landmarks.
-    """
-    from scipy.spatial.transform import Rotation as Rscipy
-
-    # Extract 3D positions (MediaPipe provides pseudo-depth via z * w)
-    # Need the original landmarks object for z — we store z in pts_3d
-    # But pts only has (x,y). We need the caller to provide 3D points.
-    # This function expects pts to have already been converted differently.
-    # We'll handle this via a separate 3D points array passed from visionc.
-    raise NotImplementedError("use compute_pca_orientation_3d instead")
-
-
-def compute_pca_orientation_3d(points_3d, ref_matrix):
-    """PCA-based head orientation from pre-extracted 3D nose landmarks.
-
-    Args:
-        points_3d:  (K, 3) array of 3D landmark positions.
-        ref_matrix: Single-element list [R_ref | None] — mutated in-place
-                    to stabilise eigenvector directions across frames.
-
-    Returns:
-        (center_3d, R_final)
-        - center_3d: (3,) mean position.
-        - R_final:   (3,3) stabilised rotation matrix.
-    """
-    from scipy.spatial.transform import Rotation as Rscipy
-
-    center = np.mean(points_3d, axis=0)
-
-    # PCA via covariance eigendecomposition
-    centered = points_3d - center
-    cov = np.cov(centered.T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    eigvecs = eigvecs[:, np.argsort(-eigvals)]  # major axes first
-
-    # Ensure right-handed coordinate system
-    if np.linalg.det(eigvecs) < 0:
-        eigvecs[:, 2] *= -1
-
-    # Round-trip through Euler angles (keeps consistent axis convention)
-    r = Rscipy.from_matrix(eigvecs)
-    roll, pitch, yaw = r.as_euler('zyx', degrees=False)
-    R_final = Rscipy.from_euler('zyx', [roll, pitch, yaw]).as_matrix()
-
-    # Stabilise against eigenvector sign flips using reference matrix
-    if ref_matrix[0] is None:
-        ref_matrix[0] = R_final.copy()
-    else:
-        R_ref = ref_matrix[0]
-        for i in range(3):
-            if np.dot(R_final[:, i], R_ref[:, i]) < 0:
-                R_final[:, i] *= -1
-
-    return center, R_final
-
-
-def lock_eye_spheres(head_center, R_final, iris_3d_left, iris_3d_right,
-                     nose_points_3d, base_radius=20):
-    """Lock eye sphere positions in head-local coordinates.
-
-    During calibration, store the iris position relative to the head center
-    in the head's local coordinate system, offset by base_radius along the
-    camera direction.  This allows reconstruction at any head pose / distance.
-
-    Args:
-        head_center:     (3,) 3D head center from PCA.
-        R_final:         (3,3) head rotation matrix.
-        iris_3d_left:    (3,) 3D position of left iris center.
-        iris_3d_right:   (3,) 3D position of right iris center.
-        nose_points_3d:  (K,3) nose landmark positions (for scale).
-        base_radius:     Sphere radius at calibration distance.
-
-    Returns:
-        (left_offset, right_offset, calib_nose_scale)
-    """
-    camera_dir_world = np.array([0, 0, 1], dtype=float)
-    camera_dir_local = R_final.T @ camera_dir_world
-
-    left_offset = R_final.T @ (iris_3d_left - head_center)
-    left_offset += base_radius * camera_dir_local
-
-    right_offset = R_final.T @ (iris_3d_right - head_center)
-    right_offset += base_radius * camera_dir_local
-
-    calib_scale = compute_nose_scale(nose_points_3d)
-    return left_offset, right_offset, calib_scale
-
-
-def compute_sphere_positions(head_center, R_final, left_offset, right_offset,
-                             nose_points_3d, calib_nose_scale, base_radius=20):
-    """Reconstruct eye sphere world positions from stored offsets.
-
-    Scales the offsets by the ratio of current-to-calibration nose landmark
-    distances to compensate for the user moving closer/farther.
-
-    Returns:
-        (sphere_l, sphere_r, scaled_radius)
-    """
-    current_scale = compute_nose_scale(nose_points_3d)
-    scale_ratio = current_scale / calib_nose_scale if calib_nose_scale > 0 else 1.0
-
-    sphere_l = head_center + R_final @ (left_offset * scale_ratio)
-    sphere_r = head_center + R_final @ (right_offset * scale_ratio)
-    scaled_radius = int(base_radius * scale_ratio)
-
-    return sphere_l, sphere_r, scaled_radius
-
-
-def compute_binocular_gaze(sphere_l, sphere_r, iris_3d_left, iris_3d_right):
-    """Compute combined gaze direction from both eyes.
-
-    Gaze direction = iris_3d - sphere_center (from eye center toward iris).
-
-    Returns:
-        Normalized (3,) gaze direction vector, or None if degenerate.
-    """
-    left_dir = iris_3d_left - sphere_l
-    right_dir = iris_3d_right - sphere_r
-
-    ln = np.linalg.norm(left_dir)
-    rn = np.linalg.norm(right_dir)
-
-    if ln < 1e-9 and rn < 1e-9:
-        return None
-
-    parts = []
-    if ln > 1e-9:
-        parts.append(left_dir / ln)
-    if rn > 1e-9:
-        parts.append(right_dir / rn)
-
-    combined = np.mean(parts, axis=0)
-    n = np.linalg.norm(combined)
-    if n < 1e-9:
-        return None
-    return combined / n
-
-
-def gaze_to_screen(gaze_dir, yaw_range=15.0, pitch_range=5.0):
-    """Direct angular mapping from 3D gaze direction to screen coordinates.
-
-    Ported directly from MonitorTracking.py's convert_gaze_to_screen_coordinates.
-
-    Args:
-        gaze_dir:    Normalized (3,) gaze direction vector.
-        yaw_range:   Degrees at which the gaze reaches screen edges horizontally.
-        pitch_range: Degrees at which the gaze reaches screen edges vertically.
-
-    Returns:
-        (norm_x, norm_y) in 0–1 range (clamped).
-    """
-    reference_forward = np.array([0, 0, -1], dtype=float)
-    avg_dir = gaze_dir / np.linalg.norm(gaze_dir)
-
-    # Horizontal (yaw) angle from reference Z-axis
-    xz_proj = np.array([avg_dir[0], 0, avg_dir[2]], dtype=float)
-    xz_n = np.linalg.norm(xz_proj)
-    if xz_n < 1e-9:
-        yaw_deg = 0.0
-    else:
-        xz_proj /= xz_n
-        yaw_rad = math.acos(np.clip(np.dot(reference_forward, xz_proj), -1.0, 1.0))
-        if avg_dir[0] < 0:
-            yaw_rad = -yaw_rad
-        yaw_deg = float(np.degrees(yaw_rad))
-
-    # Vertical (pitch) angle from reference Z-axis
-    yz_proj = np.array([0, avg_dir[1], avg_dir[2]], dtype=float)
-    yz_n = np.linalg.norm(yz_proj)
-    if yz_n < 1e-9:
-        pitch_deg = 0.0
-    else:
-        yz_proj /= yz_n
-        pitch_rad = math.acos(np.clip(np.dot(reference_forward, yz_proj), -1.0, 1.0))
-        if avg_dir[1] > 0:
-            pitch_rad = -pitch_rad
-        pitch_deg = float(np.degrees(pitch_rad))
-
-    # MonitorTracking sign convention for yaw
-    yaw_deg = -yaw_deg
-
-    # Map to normalised 0–1 screen coordinates
-    norm_x = (yaw_deg + yaw_range) / (2 * yaw_range)
-    norm_y = (pitch_range - pitch_deg) / (2 * pitch_range)
-
-    norm_x = float(np.clip(norm_x, 0, 1))
-    norm_y = float(np.clip(norm_y, 0, 1))
-
-    return norm_x, norm_y
-
-
-def compute_nose_scale(points_3d):
-    """Average pairwise distance of landmark points — used for scale estimation.
-
-    From MonitorTracking.py's compute_scale.
-    """
-    n = len(points_3d)
-    total = 0.0
-    count = 0
+def compute_scale(pts: np.ndarray) -> float:
+    """Mean pairwise distance of a point cloud. Robust distance proxy."""
+    n = len(pts)
+    total = count = 0
     for i in range(n):
         for j in range(i + 1, n):
-            total += float(np.linalg.norm(points_3d[i] - points_3d[j]))
+            total += np.linalg.norm(pts[i] - pts[j])
             count += 1
     return total / count if count > 0 else 1.0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  PCA HEAD POSE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pca_orientation(points_3d: np.ndarray,
+                    ref_container: list) -> tuple:
+    """
+    Compute head centre and rotation matrix from a point cloud via PCA.
+
+    ref_container : [None] on first call; stores reference matrix to prevent
+                    eigenvector sign flips between frames.
+
+    Returns
+    -------
+    center : (3,) world-space head centre
+    R      : (3,3) rotation matrix (head frame)
+    """
+    center   = np.mean(points_3d, axis=0)
+    centered = points_3d - center
+    cov      = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    eigvecs  = eigvecs[:, np.argsort(-eigvals)]
+
+    if np.linalg.det(eigvecs) < 0:
+        eigvecs[:, 2] *= -1
+
+    r = Rscipy.from_matrix(eigvecs)
+    roll, pitch, yaw = r.as_euler('zyx', degrees=False)
+    R = Rscipy.from_euler('zyx', [roll, pitch, yaw]).as_matrix()
+
+    # Stabilise sign to prevent eigenvector flips
+    if ref_container[0] is None:
+        ref_container[0] = R.copy()
+    else:
+        for i in range(3):
+            if np.dot(R[:, i], ref_container[0][:, i]) < 0:
+                R[:, i] *= -1
+
+    return center, R
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MONITOR PLANE  (3D world-space quad the gaze ray intersects)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_monitor_plane(head_center, R_final, face_landmarks,
+                         fw: int, fh: int,
+                         fwd=None, go=None, gd=None):
+    """
+    Build a 60 cm × 40 cm plane 50 cm in front of the face.
+
+    Parameters
+    ----------
+    head_center     : (3,) world-space head centre (from pca_orientation)
+    R_final         : (3,3) head rotation matrix
+    face_landmarks  : MediaPipe landmark list
+    fw, fh          : camera frame width / height (pixels)
+    fwd             : optional forward-hint direction (normalised)
+    go              : gaze origin (midpoint between eye spheres)
+    gd              : gaze direction (combined normalised)
+
+    Returns
+    -------
+    corners    : [p0, p1, p2, p3]  four world-space corner points
+    center_w   : (3,) world-space plane centre
+    normal_w   : (3,) unit outward normal
+    upc        : float  world-units-per-centimetre
+    """
+    # Estimate scale: chin-to-forehead ≈ 15 cm
+    try:
+        lc = face_landmarks[152]
+        lf = face_landmarks[10]
+        chin_w = np.array([lc.x * fw, lc.y * fh, lc.z * fw], dtype=float)
+        fore_w = np.array([lf.x * fw, lf.y * fh, lf.z * fw], dtype=float)
+        upc = np.linalg.norm(fore_w - chin_w) / 15.0
+    except Exception:
+        upc = 5.0
+
+    half_w = 30.0 * upc   # 60 cm wide
+    half_h = 20.0 * upc   # 40 cm tall
+
+    head_fwd = -R_final[:, 2]
+    if fwd is not None:
+        head_fwd = np.asarray(fwd) / np.linalg.norm(fwd)
+
+    # Place centre on gaze ray if available, else 50 cm straight ahead
+    if go is not None and gd is not None:
+        gdn = gd / np.linalg.norm(gd)
+        plane_pt = head_center + head_fwd * (50.0 * upc)
+        dn = np.dot(head_fwd, gdn)
+        center_w = (go + np.dot(head_fwd, plane_pt - go) / dn * gdn
+                    if abs(dn) > 1e-6
+                    else head_center + head_fwd * (50.0 * upc))
+    else:
+        center_w = head_center + head_fwd * (50.0 * upc)
+
+    world_up   = np.array([0, -1, 0], dtype=float)
+    head_right = np.cross(world_up, head_fwd)
+    head_right /= np.linalg.norm(head_right)
+    head_up    = np.cross(head_fwd, head_right)
+    head_up    /= np.linalg.norm(head_up)
+
+    p0 = center_w - head_right * half_w - head_up * half_h  # TL
+    p1 = center_w + head_right * half_w - head_up * half_h  # TR
+    p2 = center_w + head_right * half_w + head_up * half_h  # BR
+    p3 = center_w - head_right * half_w + head_up * half_h  # BL
+
+    normal_w = head_fwd / np.linalg.norm(head_fwd)
+    return [p0, p1, p2, p3], center_w, normal_w, upc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  RAY–PLANE INTERSECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ray_plane_ab(O, D, corners, center, normal):
+    """
+    Intersect ray  P(t) = O + t·D  with the monitor quad.
+
+    Returns
+    -------
+    (a, b)  : normalised quad coordinates  (may exceed [0,1])
+              a=0 left, a=1 right, b=0 top, b=1 bottom
+    None    : ray is parallel or intersection is behind the eye
+    """
+    N = normalize(normal)
+    d = float(np.dot(N, D))
+    if abs(d) < 1e-6:
+        return None
+    t = float(np.dot(N, np.asarray(center) - O) / d)
+    if t < 0.0:
+        return None
+    P = O + t * D
+
+    p0, p1, _, p3 = [np.asarray(p, dtype=float) for p in corners]
+    u  = p1 - p0
+    v  = p3 - p0
+    u2 = float(np.dot(u, u))
+    v2 = float(np.dot(v, v))
+    if u2 < 1e-9 or v2 < 1e-9:
+        return None
+
+    wv = P - p0
+    return float(np.dot(wv, u) / u2), float(np.dot(wv, v) / v2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CALIBRATION MANAGER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CalibrationManager:
+    """
+    Persists sphere offsets + homography to calibration.json.
+
+    What is saved
+    -------------
+    left_offset / right_offset  — eyeball sphere position in head-local frame
+    left_scale  / right_scale   — nose scale at calibration time
+    homography                  — 3×3 matrix from 4-point gaze calibration
+
+    What is NOT saved
+    -----------------
+    Monitor plane corners — these depend on current head position.
+    Press C at session start to re-anchor the plane (< 5 seconds).
+    """
+
+    def save(self, left_offset, right_offset,
+             left_scale, right_scale, H) -> None:
+        data = {
+            'left_offset':  left_offset.tolist(),
+            'right_offset': right_offset.tolist(),
+            'left_scale':   float(left_scale),
+            'right_scale':  float(right_scale),
+            'homography':   H.tolist() if H is not None else None,
+        }
+        with open(CALIB_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"[CalibrationManager] Saved → {CALIB_FILE}")
+
+    def load(self) -> dict | None:
+        if not os.path.exists(CALIB_FILE):
+            return None
+        try:
+            with open(CALIB_FILE) as f:
+                d = json.load(f)
+            return {
+                'left_offset':  np.array(d['left_offset']),
+                'right_offset': np.array(d['right_offset']),
+                'left_scale':   float(d['left_scale']),
+                'right_scale':  float(d['right_scale']),
+                'homography':   (np.array(d['homography'])
+                                 if d['homography'] is not None else None),
+            }
+        except Exception as e:
+            print(f"[CalibrationManager] Load failed: {e}")
+            return None
+
+    def exists(self) -> bool:
+        return os.path.exists(CALIB_FILE)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GAZE DATA COLLECTOR  (training data for future personal ML model)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GazeDataCollector:
+    """
+    Silently logs one CSV row per confirmed key activation.
+
+    Columns
+    -------
+    ts                    : Unix timestamp
+    il_x, il_y, il_z      : left iris 3D position (camera space)
+    ir_x, ir_y, ir_z      : right iris 3D position
+    roll, pitch, yaw      : head Euler angles (degrees)
+    a_raw, b_raw          : uncorrected gaze position on monitor plane
+    key_row, key_col, key : ground-truth label
+
+    Usage (future)
+    --------------
+    Run  scripts/train_gaze_model.py  once enough samples are collected
+    (~500+) to train a personal MLP that replaces the geometry pipeline.
+    """
+
+    HEADER = [
+        'ts',
+        'il_x', 'il_y', 'il_z',
+        'ir_x', 'ir_y', 'ir_z',
+        'roll', 'pitch', 'yaw',
+        'a_raw', 'b_raw',
+        'key_row', 'key_col', 'key'
+    ]
+
+    def __init__(self):
+        write_header = not os.path.exists(GAZE_DATA_FILE)
+        self._f = open(GAZE_DATA_FILE, 'a', newline='')
+        self._w = csv.writer(self._f)
+        if write_header:
+            self._w.writerow(self.HEADER)
+        # Count existing rows
+        self.count = 0
+        if not write_header:
+            try:
+                with open(GAZE_DATA_FILE) as tmp:
+                    self.count = max(0, sum(1 for _ in tmp) - 1)
+            except Exception:
+                pass
+
+    def log(self, iris_l, iris_r, R_final,
+            a_raw: float, b_raw: float,
+            key_row: int, key_col: int, key: str) -> None:
+        try:
+            r  = Rscipy.from_matrix(R_final)
+            roll, pitch, yaw = r.as_euler('zyx', degrees=True)
+            self._w.writerow([
+                round(float(__import__('time').time()), 4),
+                *[round(float(v), 4) for v in iris_l],
+                *[round(float(v), 4) for v in iris_r],
+                round(roll,  3), round(pitch, 3), round(yaw, 3),
+                round(a_raw, 5), round(b_raw, 5),
+                key_row, key_col, key,
+            ])
+            self._f.flush()
+            self.count += 1
+        except Exception as e:
+            print(f"[GazeDataCollector] {e}")
+
+    def close(self) -> None:
+        self._f.close()
