@@ -52,10 +52,20 @@ except ImportError:
 import mediapipe as mp
 from scipy.spatial.transform import Rotation as Rscipy
 
+# ── MediaPipe compatibility (old solutions API vs new Tasks API) ──────────
+_USE_LEGACY_MP = False
+try:
+    _mp_fm = mp.solutions.face_mesh
+    _USE_LEGACY_MP = True
+except AttributeError:
+    from mediapipe.tasks.python import vision as _mp_vision
+    from mediapipe.tasks.python.core.base_options import BaseOptions as _BaseOpts
+
 from src.config import (
     BASE_RADIUS,
     ORBIT_YAW, ORBIT_PITCH, ORBIT_RADIUS,
     NOSE_IDX,
+    CALIB_FILE, GAZE_DATA_FILE, FACE_LANDMARKER,
 )
 from src.utils import (
     normalize, compute_scale, pca_orientation,
@@ -81,14 +91,27 @@ def main():
     }
 
     # ── MediaPipe ─────────────────────────────────────────────────────────
-    mp_fm = mp.solutions.face_mesh
-    face_mesh = mp_fm.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    if _USE_LEGACY_MP:
+        face_mesh = _mp_fm.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+    else:
+        _fl_opts = _mp_vision.FaceLandmarkerOptions(
+            base_options=_BaseOpts(model_asset_path=FACE_LANDMARKER),
+            running_mode=_mp_vision.RunningMode.VIDEO,
+            num_faces=1,
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        face_mesh = _mp_vision.FaceLandmarker.create_from_options(_fl_opts)
+        _mp_ts = 0   # monotonic frame timestamp for VIDEO mode
     cap = cv2.VideoCapture(0)
     fw  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     fh  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -147,7 +170,7 @@ def main():
 
     # ── Load saved calibration hint ───────────────────────────────────────
     if cal_mgr.exists():
-        print(f"[EyeWave] Saved calibration found ({cal_mgr.FILE}).")
+        print(f"[EyeWave] Saved calibration found ({CALIB_FILE}).")
         print("  Press C to load it and set the monitor plane.")
     else:
         print("[EyeWave] No saved calibration — press C for fresh calibration.")
@@ -166,7 +189,7 @@ def main():
     print("  M        — Switch mode: Scanning / Gaze-dwell")
     print("  B        — Toggle blink selection")
     print("  Q        — Quit")
-    print(f"  Gaze samples logged → {collector.FILE}  ({collector.count} so far)")
+    print(f"  Gaze samples logged → {GAZE_DATA_FILE}  ({collector.count} so far)")
     print()
 
     scanner.start()     # start scanning immediately on launch
@@ -184,13 +207,26 @@ def main():
         last_ft = now
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results   = face_mesh.process(frame_rgb)
+
+        # Detect landmarks (legacy or Tasks API)
+        if _USE_LEGACY_MP:
+            results = face_mesh.process(frame_rgb)
+            _face_found = bool(results.multi_face_landmarks)
+            if _face_found:
+                lms = results.multi_face_landmarks[0].landmark
+        else:
+            _mp_ts += 1
+            mp_img  = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+            results = face_mesh.detect_for_video(mp_img, _mp_ts)
+            _face_found = bool(results.face_landmarks)
+            if _face_found:
+                lms = results.face_landmarks[0]
 
         gaze_row_hint = gaze_col_hint = None   # hints for scanner
 
         # ── Face mesh ─────────────────────────────────────────────────────
-        if results.multi_face_landmarks:
-            lms  = results.multi_face_landmarks[0].landmark
+        if _face_found:
+            # lms already set above by the detect block
             npts = np.array([[lms[i].x*fw, lms[i].y*fh, lms[i].z*fw]
                               for i in NOSE_IDX])
             hc, Rf = pca_orientation(npts, R_ref)
@@ -332,9 +368,9 @@ def main():
 
         # ── Debug orbit view ───────────────────────────────────────────────
         lms3d = None
-        if results.multi_face_landmarks:
+        if _face_found:
             lms3d = np.array([[p.x*fw, p.y*fh, p.z*fw]
-                              for p in results.multi_face_landmarks[0].landmark])
+                              for p in lms])
         render_debug_view_orbit(
             fh, fw,
             orbit_yaw=orbit['yaw'], orbit_pitch=orbit['pitch'],
@@ -515,7 +551,7 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
     print(f"\n[EyeWave] Session ended.  "
-          f"{collector.count} gaze samples saved → {collector.FILE}")
+          f"{collector.count} gaze samples saved → {GAZE_DATA_FILE}")
 
 
 if __name__ == "__main__":

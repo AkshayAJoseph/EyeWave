@@ -34,6 +34,7 @@ from src.config import (
     GRID_X, GRID_Y, GRID_W, GRID_H,
     TEXT_Y, TEXT_H, SUGG_Y,
     CLICK_SOUND,
+    CALIB_MIN_STABLE,
 )
 from src.visionc import (
     SmartDwellController,
@@ -222,9 +223,9 @@ class EyeKeyboard:
 
         if calib.active and calib.current_label:
             n   = calib.stable_count
-            bar = min(n, calib.MIN_STABLE)
+            bar = min(n, CALIB_MIN_STABLE)
             msg = (f"  Look at {calib.current_label}  "
-                   f"({bar}/{calib.MIN_STABLE} stable) → SPACE to confirm")
+                   f"({bar}/{CALIB_MIN_STABLE} stable) → SPACE to confirm")
             cv2.putText(frame, msg, (6, GRID_Y - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                         (0, 220, 255), 1, cv2.LINE_AA)
