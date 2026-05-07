@@ -248,7 +248,7 @@ class CalibrationManager:
         }
         with open(CALIB_FILE, 'w') as f:
             json.dump(data, f, indent=2)
-        print(f"[CalibrationManager] Saved → {CALIB_FILE}")
+        print(f"[CalibrationManager] Saved -> {CALIB_FILE}")
 
     def load(self) -> dict | None:
         if not os.path.exists(CALIB_FILE):

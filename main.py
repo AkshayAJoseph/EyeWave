@@ -56,15 +56,19 @@ from scipy.spatial.transform import Rotation as Rscipy
 _USE_LEGACY_MP = False
 try:
     _mp_fm = mp.solutions.face_mesh
+    # Test-instantiate to catch protobuf 5.x runtime breakage
+    _test = _mp_fm.FaceMesh(static_image_mode=True, max_num_faces=1)
+    _test.close()
+    del _test
     _USE_LEGACY_MP = True
-except AttributeError:
+except Exception:
     from mediapipe.tasks.python import vision as _mp_vision
     from mediapipe.tasks.python.core.base_options import BaseOptions as _BaseOpts
 
 from src.config import (
     BASE_RADIUS,
     ORBIT_YAW, ORBIT_PITCH, ORBIT_RADIUS,
-    NOSE_IDX,
+    NOSE_IDX, BLINK_EAR_THRESH,
     CALIB_FILE, GAZE_DATA_FILE, FACE_LANDMARKER,
 )
 from src.utils import (
@@ -181,15 +185,15 @@ def main():
                           cv2.WND_PROP_FULLSCREEN,
                           cv2.WINDOW_FULLSCREEN)
 
-    print("\nEyeWave  —  Eye-Tracking AAC Keyboard")
-    print("─────────────────────────────────────────────")
-    print("  C        — Calibrate (loads saved if available)")
-    print("  1-4+SPC  — 4-point corner calibration")
-    print("  TAB      — Switch layout: QWERTY / AAC")
-    print("  M        — Switch mode: Scanning / Gaze-dwell")
-    print("  B        — Toggle blink selection")
-    print("  Q        — Quit")
-    print(f"  Gaze samples logged → {GAZE_DATA_FILE}  ({collector.count} so far)")
+    print("\nEyeWave  -  Eye-Tracking AAC Keyboard")
+    print("-" * 45)
+    print("  C        - Calibrate (loads saved if available)")
+    print("  1-4+SPC  - 4-point corner calibration")
+    print("  TAB      - Switch layout: QWERTY / AAC")
+    print("  M        - Switch mode: Scanning / Gaze-dwell")
+    print("  B        - Toggle blink selection")
+    print("  Q        - Quit")
+    print(f"  Gaze samples logged -> {GAZE_DATA_FILE}  ({collector.count} so far)")
     print()
 
     scanner.start()     # start scanning immediately on launch
@@ -215,7 +219,7 @@ def main():
             if _face_found:
                 lms = results.multi_face_landmarks[0].landmark
         else:
-            _mp_ts += 1
+            _mp_ts = int(time.time() * 1000)
             mp_img  = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
             results = face_mesh.detect_for_video(mp_img, _mp_ts)
             _face_found = bool(results.face_landmarks)
@@ -223,6 +227,9 @@ def main():
                 lms = results.face_landmarks[0]
 
         gaze_row_hint = gaze_col_hint = None   # hints for scanner
+
+        # ── Blink update (ALWAYS runs, even when face lost) ───────────
+        blinker.update(lms if _face_found else None, fw, fh)
 
         # ── Face mesh ─────────────────────────────────────────────────────
         if _face_found:
@@ -240,8 +247,10 @@ def main():
                 cv2.circle(frame, (int(lm.x*fw), int(lm.y*fh)),
                            0, (255, 255, 255), -1)
 
-            # Blink update
-            blinker.update(lms, fw, fh)
+            # EAR value overlay on camera preview
+            ear_col = (0, 0, 255) if blinker.ear < BLINK_EAR_THRESH else (0, 255, 0)
+            cv2.putText(frame, f"EAR:{blinker.ear:.3f}", (fw - 160, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, ear_col, 2)
 
             # Eye sphere positions
             cns = compute_scale(npts)
@@ -437,7 +446,7 @@ def main():
                 else "Mode: GAZE DWELL"
             )
             last_m = now
-            print(f"[Mode] → {sel_mode.upper()}")
+            print(f"[Mode] -> {sel_mode.upper()}")
 
         # B — toggle blink
         elif key == ord('b') and now - last_b > 0.5:
@@ -446,6 +455,13 @@ def main():
                                    f"{'ON' if blinker.enabled else 'OFF'}")
             last_b = now
             print(f"[Blink] {'ON' if blinker.enabled else 'OFF'}")
+
+        # D -- toggle EAR debug logging
+        elif key == ord('d'):
+            blinker.debug_ear = not blinker.debug_ear
+            state = 'ON' if blinker.debug_ear else 'OFF'
+            keyboard_gui.status = f"EAR debug: {state}"
+            print(f"[Debug] EAR logging {state}")
 
         # C — calibrate / load saved
         elif key == ord('c') and hc is not None:

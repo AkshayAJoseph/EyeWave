@@ -170,5 +170,6 @@ NOSE_IDX = [4,45,275,220,440,1,5,51,281,44,274,241,
             461,125,354,218,438,195,167,393,165,391,3,248]
 
 # MediaPipe: EAR landmark indices (blink detection)
-LEFT_EYE_EAR  = [362, 385, 387, 263, 373, 380]
+# Order: [outer_corner, upper_lid_1, upper_lid_2, inner_corner, lower_lid_1, lower_lid_2]
+LEFT_EYE_EAR  = [263, 385, 387, 362, 373, 380]
 RIGHT_EYE_EAR = [33,  160, 158, 133, 153, 144]

@@ -277,7 +277,7 @@ class MultiPointCalib:
         samples = (self._stable if len(self._stable) >= CALIB_MIN_STABLE
                    else list(self._all))
         if not samples:
-            print("[MultiPointCalib] No samples — keep looking at the corner.")
+            print("[MultiPointCalib] No samples -- keep looking at the corner.")
             return False
 
         arr = np.array(samples)
@@ -306,9 +306,9 @@ class MultiPointCalib:
         dst = np.array(self.TARGETS, dtype=np.float32)
         self._H, _ = cv2.findHomography(src, dst)
         if self._H is not None:
-            print("[MultiPointCalib] Homography built — correction active.")
+            print("[MultiPointCalib] Homography built -- correction active.")
         else:
-            print("[MultiPointCalib] Homography failed — redo corner calibration.")
+            print("[MultiPointCalib] Homography failed -- redo corner calibration.")
 
     def correct(self, a: float, b: float) -> tuple:
         if self._H is None:
@@ -351,6 +351,8 @@ class BlinkDetector:
         self.enabled      = True
         self.blink        = False
         self.double_blink = False
+        self.ear          = 0.3      # expose current EAR for debug display
+        self.debug_ear    = False    # set True to print EAR values
         self._closed_t    = None    # time (ms) the eye went below threshold
         self._last_blink  = 0.0    # time (ms) of last confirmed blink
 
@@ -372,7 +374,12 @@ class BlinkDetector:
         ear_l = self._ear(lms, LEFT_EYE_EAR,  w, h)
         ear_r = self._ear(lms, RIGHT_EYE_EAR, w, h)
         ear   = (ear_l + ear_r) / 2.0
+        self.ear = ear
         now   = time.time() * 1000   # work in milliseconds
+
+        if self.debug_ear:
+            state = "CLOSED" if ear < BLINK_EAR_THRESH else "open"
+            print(f"[EAR] L={ear_l:.3f} R={ear_r:.3f} avg={ear:.3f} [{state}]")
 
         if ear < BLINK_EAR_THRESH:
             if self._closed_t is None:
@@ -385,9 +392,16 @@ class BlinkDetector:
                     gap = now - self._last_blink
                     if gap <= BLINK_DOUBLE_GAP_MS:
                         self.double_blink = True
+                        if self.debug_ear:
+                            print(f"[BLINK] DOUBLE blink ({dur:.0f}ms)")
                     else:
                         self.blink = True
+                        if self.debug_ear:
+                            print(f"[BLINK] Single blink ({dur:.0f}ms)")
                     self._last_blink = now
+                elif self.debug_ear:
+                    reason = "too short" if dur < BLINK_MIN_MS else "too long"
+                    print(f"[BLINK] Rejected ({dur:.0f}ms, {reason})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
