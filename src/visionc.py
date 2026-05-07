@@ -35,7 +35,7 @@ from src.config import (
     # Blink
     BLINK_EAR_THRESH, BLINK_MIN_MS, BLINK_MAX_MS, BLINK_DOUBLE_GAP_MS,
     # Scanner
-    SCAN_ROW_RATE, SCAN_COL_RATE,
+    SCAN_ROW_RATE, SCAN_COL_RATE, SCAN_COL_TIMEOUT,
     # Calibration
     CALIB_STABLE_DISP_MAX, CALIB_STABLE_WINDOW, CALIB_MIN_STABLE,
     # Orbit defaults
@@ -436,6 +436,7 @@ class ScanningController:
         self.scan_row      = 0
         self.scan_col      = 0
         self._step_t       = time.time()
+        self._col_enter    = time.time()   # when column scanning started
         self._n_rows       = 6
         self._n_cols       = 10
         self.activated_key = None
@@ -473,9 +474,17 @@ class ScanningController:
         if not self.enabled:
             return None
 
-        # Double blink always cancels
+        # Double blink — context-sensitive cancel
+        #   COL mode → go back to ROW (re-select correct row)
+        #   ROW mode → go to IDLE (stop scanning)
         if double_blink:
-            self.state = self.ST_IDLE
+            if self.state == self.ST_COL:
+                self.state    = self.ST_ROW
+                self.scan_col = 0
+                self._step_t  = now
+                print("[Scanner] Double-blink: back to ROW scanning")
+            else:
+                self.state = self.ST_IDLE
             return None
 
         if self.state == self.ST_IDLE:
@@ -491,8 +500,9 @@ class ScanningController:
                     self._step_t  = now
 
             if blink:
-                self.state    = self.ST_COL
-                self.scan_col = 0
+                self.state       = self.ST_COL
+                self.scan_col    = 0
+                self._col_enter  = now   # track when column scanning started
                 if self.gaze_assisted and gaze_col is not None:
                     self.scan_col = gaze_col
                 self._step_t  = now
@@ -504,6 +514,14 @@ class ScanningController:
                 self._step_t  = now
 
         elif self.state == self.ST_COL:
+            # Timeout: auto-return to row scanning if no selection
+            if now - self._col_enter >= SCAN_COL_TIMEOUT:
+                self.state    = self.ST_ROW
+                self.scan_col = 0
+                self._step_t  = now
+                print("[Scanner] Column timeout: back to ROW scanning")
+                return None
+
             # Gaze jump to looked-at column
             if self.gaze_assisted and gaze_col is not None:
                 if gaze_col != self.scan_col:

@@ -148,6 +148,7 @@ BLINK_DOUBLE_GAP_MS    = 700    # window for double-blink detection
 # Scanner
 SCAN_ROW_RATE          = 1.5    # seconds per row
 SCAN_COL_RATE          = 1.2    # seconds per column
+SCAN_COL_TIMEOUT       = 8.0    # seconds before col scan auto-returns to row scan
 
 # Calibration (corner)
 CALIB_STABLE_DISP_MAX  = 0.025
