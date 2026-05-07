@@ -12,7 +12,6 @@ import numpy as np
 
 from src.config import (
     KBD_WIN_W, KBD_WIN_H,
-    SCAN_SPEED_MIN, SCAN_SPEED_MAX,
 )
 
 
@@ -37,7 +36,6 @@ class SettingsOverlay:
             ("Scan Col Speed",    "scan_col_rate",    0.5,   4.0,   0.1,   "{:.1f}s"),
             ("Col Timeout",       "scan_col_timeout", 3.0,   20.0,  1.0,   "{:.0f}s"),
             ("Audio",             "audio_enabled",    0,     1,     1,     "toggle"),
-            ("Adaptive Speed",    "adaptive_speed",   0,     1,     1,     "toggle"),
             ("Blink Min (ms)",    "blink_min_ms",     50,    300,   10,    "{:.0f}"),
             ("Blink Max (ms)",    "blink_max_ms",     300,   800,   25,    "{:.0f}"),
             ("Long Blink Max",    "blink_long_max_ms", 800,  2000,  50,    "{:.0f}"),

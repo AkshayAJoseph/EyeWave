@@ -38,7 +38,6 @@ from src.config import (
     BLINK_DOUBLE_GAP_MS,
     # Scanner
     SCAN_ROW_RATE, SCAN_COL_RATE, SCAN_COL_TIMEOUT,
-    SCAN_SPEED_MIN, SCAN_SPEED_MAX,
     # Audio
     AUDIO_ENABLED, AUDIO_ROW_TICK, AUDIO_COL_TICK,
     AUDIO_ROW_SELECT, AUDIO_CANCEL, AUDIO_KEY_ACTIVATE, AUDIO_UNDO,
@@ -519,21 +518,6 @@ class ScanningController:
         # Audio feedback
         self.audio = AudioFeedback()
 
-        # Adaptive scan speed
-        self.adaptive        = True
-        self._row_rate       = SCAN_ROW_RATE
-        self._col_rate       = SCAN_COL_RATE
-        self._resp_row       = collections.deque(maxlen=10)
-        self._resp_col       = collections.deque(maxlen=10)
-
-    @property
-    def row_rate(self) -> float:
-        return self._row_rate
-
-    @property
-    def col_rate(self) -> float:
-        return self._col_rate
-
     def set_layout_size(self, rows: int, cols: int):
         self._n_rows = rows
         self._n_cols = cols
@@ -549,19 +533,7 @@ class ScanningController:
     def stop(self):
         self.state = self.ST_IDLE
 
-    def _adapt_speed(self, deque, base_rate):
-        """Compute adapted rate from rolling response times."""
-        if not self.adaptive or len(deque) < 3:
-            return base_rate
-        avg = sum(deque) / len(deque)
-        # Give 20% headroom — user should have time to react
-        adapted = avg * 0.8
-        return max(SCAN_SPEED_MIN, min(SCAN_SPEED_MAX, adapted))
 
-    def _update_adaptive(self):
-        """Recalculate adaptive rates from collected response data."""
-        self._row_rate = self._adapt_speed(self._resp_row, SCAN_ROW_RATE)
-        self._col_rate = self._adapt_speed(self._resp_col, SCAN_COL_RATE)
 
     def update(self, blink: bool, double_blink: bool,
                gaze_row: int | None, gaze_col: int | None):
@@ -610,10 +582,6 @@ class ScanningController:
                     self._step_t  = now
 
             if blink:
-                # Record response time for adaptive speed
-                resp = now - self._step_t
-                self._resp_row.append(resp)
-                self._update_adaptive()
 
                 self.state       = self.ST_COL
                 self.scan_col    = 0
@@ -625,7 +593,7 @@ class ScanningController:
                 return None
 
             # Auto-advance
-            if now - self._step_t >= self._row_rate:
+            if now - self._step_t >= SCAN_ROW_RATE:
                 self.scan_row = (self.scan_row + 1) % self._n_rows
                 self._step_t  = now
                 self.audio.tick_row()
@@ -647,10 +615,6 @@ class ScanningController:
                     self._step_t  = now
 
             if blink:
-                # Record response time for adaptive speed
-                resp = now - self._step_t
-                self._resp_col.append(resp)
-                self._update_adaptive()
 
                 self.activated_key = (self.scan_row, self.scan_col)
                 self.state         = self.ST_IDLE
@@ -658,7 +622,7 @@ class ScanningController:
                 return self.activated_key
 
             # Auto-advance
-            if now - self._step_t >= self._col_rate:
+            if now - self._step_t >= SCAN_COL_RATE:
                 self.scan_col = (self.scan_col + 1) % self._n_cols
                 self._step_t  = now
                 self.audio.tick_col()

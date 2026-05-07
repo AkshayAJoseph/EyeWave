@@ -150,8 +150,6 @@ BLINK_DOUBLE_GAP_MS    = 700    # window for double-blink detection
 SCAN_ROW_RATE          = 1.5    # seconds per row
 SCAN_COL_RATE          = 1.2    # seconds per column
 SCAN_COL_TIMEOUT       = 8.0    # seconds before col scan auto-returns to row scan
-SCAN_SPEED_MIN         = 0.6    # adaptive speed lower bound (seconds)
-SCAN_SPEED_MAX         = 3.0    # adaptive speed upper bound (seconds)
 
 # Audio feedback
 AUDIO_ENABLED          = True

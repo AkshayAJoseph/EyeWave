@@ -36,7 +36,6 @@ class UserProfile:
     scan_row_rate: float = SCAN_ROW_RATE
     scan_col_rate: float = SCAN_COL_RATE
     scan_col_timeout: float = SCAN_COL_TIMEOUT
-    adaptive_speed: bool = True
 
     # Audio
     audio_enabled: bool = AUDIO_ENABLED
@@ -156,9 +155,6 @@ class ProfileManager:
         cfg.SCAN_ROW_RATE     = p.scan_row_rate
         cfg.SCAN_COL_RATE     = p.scan_col_rate
         cfg.SCAN_COL_TIMEOUT  = p.scan_col_timeout
-        scanner._row_rate     = p.scan_row_rate
-        scanner._col_rate     = p.scan_col_rate
-        scanner.adaptive      = p.adaptive_speed
 
         # Audio
         scanner.audio.enabled = p.audio_enabled
@@ -178,9 +174,8 @@ class ProfileManager:
         p.blink_min_ms     = cfg.BLINK_MIN_MS
         p.blink_max_ms     = cfg.BLINK_MAX_MS
         p.blink_long_max_ms = cfg.BLINK_LONG_MAX_MS
-        p.scan_row_rate    = scanner._row_rate
-        p.scan_col_rate    = scanner._col_rate
+        p.scan_row_rate    = cfg.SCAN_ROW_RATE
+        p.scan_col_rate    = cfg.SCAN_COL_RATE
         p.scan_col_timeout = cfg.SCAN_COL_TIMEOUT
-        p.adaptive_speed   = scanner.adaptive
         p.audio_enabled    = scanner.audio.enabled
         return p
