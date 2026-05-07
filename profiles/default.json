@@ -1,0 +1,13 @@
+{
+  "name": "default",
+  "ear_threshold": 0.21,
+  "blink_min_ms": 150,
+  "blink_max_ms": 500,
+  "blink_long_max_ms": 1200,
+  "scan_row_rate": 1.5,
+  "scan_col_rate": 1.2,
+  "scan_col_timeout": 8.0,
+  "adaptive_speed": true,
+  "audio_enabled": true,
+  "calibration": null
+}

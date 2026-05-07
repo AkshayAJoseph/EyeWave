@@ -19,6 +19,7 @@ render_debug_view_orbit — 3D orbit camera view of head, eyes, and monitor plan
 
 import math
 import time
+import collections
 
 import cv2
 import numpy as np
@@ -33,9 +34,14 @@ from src.config import (
     # Dwell
     DWELL_TIME, DWELL_COOLDOWN, DWELL_CONFIRM_FRAMES,
     # Blink
-    BLINK_EAR_THRESH, BLINK_MIN_MS, BLINK_MAX_MS, BLINK_DOUBLE_GAP_MS,
+    BLINK_EAR_THRESH, BLINK_MIN_MS, BLINK_MAX_MS, BLINK_LONG_MAX_MS,
+    BLINK_DOUBLE_GAP_MS,
     # Scanner
     SCAN_ROW_RATE, SCAN_COL_RATE, SCAN_COL_TIMEOUT,
+    SCAN_SPEED_MIN, SCAN_SPEED_MAX,
+    # Audio
+    AUDIO_ENABLED, AUDIO_ROW_TICK, AUDIO_COL_TICK,
+    AUDIO_ROW_SELECT, AUDIO_CANCEL, AUDIO_KEY_ACTIVATE, AUDIO_UNDO,
     # Calibration
     CALIB_STABLE_DISP_MAX, CALIB_STABLE_WINDOW, CALIB_MIN_STABLE,
     # Orbit defaults
@@ -44,6 +50,59 @@ from src.config import (
     LEFT_EYE_EAR, RIGHT_EYE_EAR,
 )
 from src.utils import normalize, focal_px, rot_x, rot_y, ray_plane_ab
+
+import threading
+
+try:
+    import winsound
+    _WINSOUND_OK = True
+except ImportError:
+    _WINSOUND_OK = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  AUDIO FEEDBACK
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AudioFeedback:
+    """Non-blocking audio cues for scanning events using winsound.Beep."""
+
+    def __init__(self):
+        self.enabled = AUDIO_ENABLED
+
+    def _beep(self, freq: int, dur: int):
+        if self.enabled and _WINSOUND_OK:
+            threading.Thread(target=winsound.Beep, args=(freq, dur),
+                             daemon=True).start()
+
+    def _multi_beep(self, tones: list):
+        if self.enabled and _WINSOUND_OK:
+            def _play():
+                for freq, dur in tones:
+                    winsound.Beep(freq, dur)
+            threading.Thread(target=_play, daemon=True).start()
+
+    def tick_row(self):
+        self._beep(*AUDIO_ROW_TICK)
+
+    def tick_col(self):
+        self._beep(*AUDIO_COL_TICK)
+
+    def row_selected(self):
+        self._multi_beep(AUDIO_ROW_SELECT)
+
+    def cancel(self):
+        self._multi_beep(AUDIO_CANCEL)
+
+    def key_activated(self):
+        self._beep(*AUDIO_KEY_ACTIVATE)
+
+    def undo(self):
+        self._multi_beep(AUDIO_UNDO)
+
+    def toggle(self):
+        self.enabled = not self.enabled
+        return self.enabled
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -351,6 +410,7 @@ class BlinkDetector:
         self.enabled      = True
         self.blink        = False
         self.double_blink = False
+        self.long_blink   = False     # long-blink undo gesture
         self.ear          = 0.3      # expose current EAR for debug display
         self.debug_ear    = False    # set True to print EAR values
         self._closed_t    = None    # time (ms) the eye went below threshold
@@ -368,6 +428,7 @@ class BlinkDetector:
         """Call once per frame with MediaPipe face landmarks."""
         self.blink        = False
         self.double_blink = False
+        self.long_blink   = False
         if not self.enabled or lms is None:
             return
 
@@ -389,6 +450,7 @@ class BlinkDetector:
                 dur = now - self._closed_t
                 self._closed_t = None
                 if BLINK_MIN_MS <= dur <= BLINK_MAX_MS:
+                    # Normal intentional blink
                     gap = now - self._last_blink
                     if gap <= BLINK_DOUBLE_GAP_MS:
                         self.double_blink = True
@@ -399,6 +461,11 @@ class BlinkDetector:
                         if self.debug_ear:
                             print(f"[BLINK] Single blink ({dur:.0f}ms)")
                     self._last_blink = now
+                elif BLINK_MAX_MS < dur <= BLINK_LONG_MAX_MS:
+                    # Long blink — undo gesture
+                    self.long_blink = True
+                    if self.debug_ear:
+                        print(f"[BLINK] LONG blink / undo ({dur:.0f}ms)")
                 elif self.debug_ear:
                     reason = "too short" if dur < BLINK_MIN_MS else "too long"
                     print(f"[BLINK] Rejected ({dur:.0f}ms, {reason})")
@@ -422,7 +489,15 @@ class ScanningController:
     State machine
     -------------
     IDLE ──blink──► ROW_SCAN ──blink──► COL_SCAN ──blink──► activate → IDLE
-    Any state ──double_blink──► IDLE
+    COL_SCAN ──double_blink──► ROW_SCAN  (go back to re-select row)
+    ROW_SCAN ──double_blink──► IDLE
+    COL_SCAN ──timeout──► ROW_SCAN  (auto-return after SCAN_COL_TIMEOUT)
+
+    Features
+    --------
+    - Audio feedback on all state transitions and auto-advance
+    - Adaptive scan speed based on rolling average response times
+    - Long-blink undo (handled by caller, not in this class)
     """
 
     ST_IDLE = 'idle'
@@ -441,6 +516,24 @@ class ScanningController:
         self._n_cols       = 10
         self.activated_key = None
 
+        # Audio feedback
+        self.audio = AudioFeedback()
+
+        # Adaptive scan speed
+        self.adaptive        = True
+        self._row_rate       = SCAN_ROW_RATE
+        self._col_rate       = SCAN_COL_RATE
+        self._resp_row       = collections.deque(maxlen=10)
+        self._resp_col       = collections.deque(maxlen=10)
+
+    @property
+    def row_rate(self) -> float:
+        return self._row_rate
+
+    @property
+    def col_rate(self) -> float:
+        return self._col_rate
+
     def set_layout_size(self, rows: int, cols: int):
         self._n_rows = rows
         self._n_cols = cols
@@ -455,6 +548,20 @@ class ScanningController:
 
     def stop(self):
         self.state = self.ST_IDLE
+
+    def _adapt_speed(self, deque, base_rate):
+        """Compute adapted rate from rolling response times."""
+        if not self.adaptive or len(deque) < 3:
+            return base_rate
+        avg = sum(deque) / len(deque)
+        # Give 20% headroom — user should have time to react
+        adapted = avg * 0.8
+        return max(SCAN_SPEED_MIN, min(SCAN_SPEED_MAX, adapted))
+
+    def _update_adaptive(self):
+        """Recalculate adaptive rates from collected response data."""
+        self._row_rate = self._adapt_speed(self._resp_row, SCAN_ROW_RATE)
+        self._col_rate = self._adapt_speed(self._resp_col, SCAN_COL_RATE)
 
     def update(self, blink: bool, double_blink: bool,
                gaze_row: int | None, gaze_col: int | None):
@@ -482,14 +589,17 @@ class ScanningController:
                 self.state    = self.ST_ROW
                 self.scan_col = 0
                 self._step_t  = now
+                self.audio.cancel()
                 print("[Scanner] Double-blink: back to ROW scanning")
             else:
                 self.state = self.ST_IDLE
+                self.audio.cancel()
             return None
 
         if self.state == self.ST_IDLE:
             if blink:
                 self.start()
+                self.audio.tick_row()
             return None
 
         elif self.state == self.ST_ROW:
@@ -500,18 +610,25 @@ class ScanningController:
                     self._step_t  = now
 
             if blink:
+                # Record response time for adaptive speed
+                resp = now - self._step_t
+                self._resp_row.append(resp)
+                self._update_adaptive()
+
                 self.state       = self.ST_COL
                 self.scan_col    = 0
-                self._col_enter  = now   # track when column scanning started
+                self._col_enter  = now
                 if self.gaze_assisted and gaze_col is not None:
                     self.scan_col = gaze_col
                 self._step_t  = now
+                self.audio.row_selected()
                 return None
 
             # Auto-advance
-            if now - self._step_t >= SCAN_ROW_RATE:
+            if now - self._step_t >= self._row_rate:
                 self.scan_row = (self.scan_row + 1) % self._n_rows
                 self._step_t  = now
+                self.audio.tick_row()
 
         elif self.state == self.ST_COL:
             # Timeout: auto-return to row scanning if no selection
@@ -519,6 +636,7 @@ class ScanningController:
                 self.state    = self.ST_ROW
                 self.scan_col = 0
                 self._step_t  = now
+                self.audio.cancel()
                 print("[Scanner] Column timeout: back to ROW scanning")
                 return None
 
@@ -529,14 +647,21 @@ class ScanningController:
                     self._step_t  = now
 
             if blink:
+                # Record response time for adaptive speed
+                resp = now - self._step_t
+                self._resp_col.append(resp)
+                self._update_adaptive()
+
                 self.activated_key = (self.scan_row, self.scan_col)
                 self.state         = self.ST_IDLE
+                self.audio.key_activated()
                 return self.activated_key
 
             # Auto-advance
-            if now - self._step_t >= SCAN_COL_RATE:
+            if now - self._step_t >= self._col_rate:
                 self.scan_col = (self.scan_col + 1) % self._n_cols
                 self._step_t  = now
+                self.audio.tick_col()
 
         return self.activated_key
 

@@ -82,6 +82,8 @@ from src.visionc import (
     render_debug_view_orbit,
 )
 from src.interface import LayoutManager, EyeKeyboard
+from src.profiles import ProfileManager
+from src.settings import SettingsOverlay
 
 
 def main():
@@ -172,6 +174,12 @@ def main():
     last_tab   = last_m = last_b = 0.0
     last_ft    = time.time()
 
+    # ── Profiles & Settings ───────────────────────────────────────────────
+    profile_mgr  = ProfileManager()
+    settings_gui = SettingsOverlay()
+    profile_mgr.load_default()
+    profile_mgr.apply_to(blinker, scanner)
+
     # ── Load saved calibration hint ───────────────────────────────────────
     if cal_mgr.exists():
         print(f"[EyeWave] Saved calibration found ({CALIB_FILE}).")
@@ -192,7 +200,11 @@ def main():
     print("  TAB      - Switch layout: QWERTY / AAC")
     print("  M        - Switch mode: Scanning / Gaze-dwell")
     print("  B        - Toggle blink selection")
+    print("  D        - Toggle EAR debug logging")
+    print("  S        - Settings panel (arrow keys to adjust)")
+    print("  P        - Cycle user profiles")
     print("  Q        - Quit")
+    print(f"  Profile: {profile_mgr.current.name}")
     print(f"  Gaze samples logged -> {GAZE_DATA_FILE}  ({collector.count} so far)")
     print()
 
@@ -369,9 +381,16 @@ def main():
                               gf.a, gf.b,
                               act_scan[0], act_scan[1], str(result))
 
+        # ── Long-blink undo ───────────────────────────────────────────────
+        if blinker.long_blink:
+            if keyboard_gui.undo():
+                scanner.audio.undo()
+                print("[Undo] Long blink -> removed last character")
+
         # ── Render windows ─────────────────────────────────────────────────
         kbd = keyboard_gui.draw(layout, dwell, scanner, blinker,
                                 fix_det, gf, calib, collector, sel_mode)
+        kbd = settings_gui.draw(kbd, profile_mgr)   # overlay settings if open
         cv2.imshow("EyeWave Keyboard", kbd)
         cv2.imshow("EyeWave Camera", frame)
 
@@ -431,7 +450,7 @@ def main():
             scanner.start()
             keyboard_gui.status = f"Layout: {layout.current.upper()}"
             last_tab = now
-            print(f"[Layout] → {layout.current.upper()}")
+            print(f"[Layout] -> {layout.current.upper()}")
 
         # M — toggle selection mode
         elif key == ord('m') and now - last_m > 0.5:
@@ -462,6 +481,29 @@ def main():
             state = 'ON' if blinker.debug_ear else 'OFF'
             keyboard_gui.status = f"EAR debug: {state}"
             print(f"[Debug] EAR logging {state}")
+
+        # S -- settings overlay
+        elif key == ord('s'):
+            if settings_gui.is_open:
+                # Closing: save profile and apply changes
+                profile_mgr.snapshot_from(blinker, scanner)
+                profile_mgr.save()
+                profile_mgr.apply_to(blinker, scanner)
+                keyboard_gui.status = f"Settings saved to '{profile_mgr.current.name}'"
+            settings_gui.toggle()
+
+        # P -- cycle profiles
+        elif key == ord('p') and not settings_gui.is_open:
+            profile_mgr.cycle_next()
+            profile_mgr.apply_to(blinker, scanner)
+            keyboard_gui.status = f"Profile: {profile_mgr.current.name}"
+            print(f"[Profile] Switched to '{profile_mgr.current.name}'")
+
+        # Arrow keys -- settings navigation (when overlay is open)
+        elif key in (0, 1, 2, 3) and settings_gui.is_open:
+            settings_gui.handle_key(key, profile_mgr)
+            # Live-apply changes as user adjusts
+            profile_mgr.apply_to(blinker, scanner)
 
         # C — calibrate / load saved
         elif key == ord('c') and hc is not None:

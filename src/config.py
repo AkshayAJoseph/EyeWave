@@ -143,12 +143,27 @@ DWELL_CONFIRM_FRAMES   = 5      # hysteresis: frames before hover switches
 BLINK_EAR_THRESH       = 0.21   # Eye Aspect Ratio closed threshold
 BLINK_MIN_MS           = 150    # min closed duration (intentional)
 BLINK_MAX_MS           = 500    # max closed duration (above = hold)
+BLINK_LONG_MAX_MS      = 1200   # max duration for long-blink undo gesture
 BLINK_DOUBLE_GAP_MS    = 700    # window for double-blink detection
 
 # Scanner
 SCAN_ROW_RATE          = 1.5    # seconds per row
 SCAN_COL_RATE          = 1.2    # seconds per column
 SCAN_COL_TIMEOUT       = 8.0    # seconds before col scan auto-returns to row scan
+SCAN_SPEED_MIN         = 0.6    # adaptive speed lower bound (seconds)
+SCAN_SPEED_MAX         = 3.0    # adaptive speed upper bound (seconds)
+
+# Audio feedback
+AUDIO_ENABLED          = True
+AUDIO_ROW_TICK         = (400, 40)    # (freq_hz, duration_ms) — row advance
+AUDIO_COL_TICK         = (600, 40)    # column advance
+AUDIO_ROW_SELECT       = [(500, 60), (700, 60)]   # rising tone — row confirmed
+AUDIO_CANCEL           = [(600, 60), (400, 60)]    # falling tone — cancel/timeout
+AUDIO_UNDO             = [(800, 50), (500, 50)]    # undo beep
+AUDIO_KEY_ACTIVATE     = (900, 50)    # key activated
+
+# Profiles
+PROFILES_DIR           = os.path.join(BASE_DIR, "profiles")
 
 # Calibration (corner)
 CALIB_STABLE_DISP_MAX  = 0.025

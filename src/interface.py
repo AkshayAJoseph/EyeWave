@@ -191,6 +191,15 @@ class EyeKeyboard:
             except Exception:
                 pass
 
+    def undo(self):
+        """Remove last character (long-blink gesture)."""
+        if self.typed_text:
+            self.typed_text = self.typed_text[:-1]
+            self._update_suggestions()
+            self.status = "UNDO (long blink)"
+            return True
+        return False
+
     # ── Master draw entry point ───────────────────────────────────────────
 
     def draw(self,
@@ -225,7 +234,7 @@ class EyeKeyboard:
             n   = calib.stable_count
             bar = min(n, CALIB_MIN_STABLE)
             msg = (f"  Look at {calib.current_label}  "
-                   f"({bar}/{CALIB_MIN_STABLE} stable) → SPACE to confirm")
+                   f"({bar}/{CALIB_MIN_STABLE} stable) -> SPACE to confirm")
             cv2.putText(frame, msg, (6, GRID_Y - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                         (0, 220, 255), 1, cv2.LINE_AA)
